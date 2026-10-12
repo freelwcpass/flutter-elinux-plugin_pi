@@ -13,12 +13,96 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <iostream>
+#include <streambuf>
 #include <string>
 #include <vector>
 
 namespace {
+class TimestampedStreambuf final : public std::streambuf {
+ public:
+  explicit TimestampedStreambuf(std::streambuf* destination)
+      : destination_(destination) {}
+
+ protected:
+  int_type overflow(int_type ch) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (ch == traits_type::eof()) return traits_type::not_eof(ch);
+    WriteChar(static_cast<char>(ch));
+    return ch;
+  }
+
+  std::streamsize xsputn(const char* text, std::streamsize count) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (std::streamsize i = 0; i < count; ++i) WriteChar(text[i]);
+    return count;
+  }
+
+  int sync() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return destination_->pubsync();
+  }
+
+ private:
+  void WriteChar(char ch) {
+    if (at_line_start_) WriteTimestamp();
+    destination_->sputc(ch);
+    at_line_start_ = ch == '\n';
+  }
+
+  void WriteTimestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now.time_since_epoch()) %
+                        1000;
+    const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+    localtime_r(&now_time, &local_time);
+
+    char timestamp[64];
+    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S",
+                  &local_time);
+    char prefix[96];
+    std::snprintf(prefix, sizeof(prefix), "[%s.%03lld] ", timestamp,
+                  static_cast<long long>(millis.count()));
+    destination_->sputn(prefix, std::char_traits<char>::length(prefix));
+    at_line_start_ = false;
+  }
+
+  std::streambuf* destination_;
+  std::mutex mutex_;
+  bool at_line_start_ = true;
+};
+
+TimestampedStreambuf* g_timestamped_stdout = nullptr;
+TimestampedStreambuf* g_timestamped_stderr = nullptr;
+std::streambuf* g_original_stdout = nullptr;
+std::streambuf* g_original_stderr = nullptr;
+
+void InstallTimestampedLogging() {
+  if (g_timestamped_stdout) return;
+  g_original_stdout = std::cout.rdbuf();
+  g_original_stderr = std::cerr.rdbuf();
+  g_timestamped_stdout = new TimestampedStreambuf(g_original_stdout);
+  g_timestamped_stderr = new TimestampedStreambuf(g_original_stderr);
+  std::cout.rdbuf(g_timestamped_stdout);
+  std::cerr.rdbuf(g_timestamped_stderr);
+}
+
+void UninstallTimestampedLogging() {
+  if (!g_timestamped_stdout) return;
+  std::cout.rdbuf(g_original_stdout);
+  std::cerr.rdbuf(g_original_stderr);
+  delete g_timestamped_stdout;
+  delete g_timestamped_stderr;
+  g_timestamped_stdout = nullptr;
+  g_timestamped_stderr = nullptr;
+  g_original_stdout = nullptr;
+  g_original_stderr = nullptr;
+}
+
 // GstAutoplugSelectResult is defined by gst-plugins-base but is not exported
 // in a public header on all target images. These are its stable signal values.
 constexpr gint kAutoplugSelectTry = 0;
@@ -174,6 +258,23 @@ constexpr char kStreamUnavailablePrefix[] = "STREAM_UNAVAILABLE: ";
 // NOT count against the reconnect budget the way a transient error does,
 // because retrying against the same slow link will keep failing the same way.
 constexpr char kNetworkTooSlowPrefix[] = "NETWORK_TOO_SLOW: ";
+
+bool IsAlsaDeviceBusy(const GError* error, const gchar* debug) {
+  std::string text;
+  if (error && error->message) text += error->message;
+  if (debug) {
+    if (!text.empty()) text += " ";
+    text += debug;
+  }
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return (text.find("alsasink") != std::string::npos ||
+          text.find("audio_alsa") != std::string::npos ||
+          text.find("alsa") != std::string::npos) &&
+         (text.find("busy") != std::string::npos ||
+          text.find("ebusy") != std::string::npos ||
+          text.find("could not open audio device") != std::string::npos);
+}
 
 // Stable machine prefix on the error string handed to Flutter when the channel
 // is not currently broadcasting — i.e. the origin serves a 200 but the body is
@@ -476,10 +577,16 @@ GstVideoPlayer::~GstVideoPlayer() {
 }
 
 // static
-void GstVideoPlayer::GstLibraryLoad() { gst_init(NULL, NULL); }
+void GstVideoPlayer::GstLibraryLoad() {
+  InstallTimestampedLogging();
+  gst_init(NULL, NULL);
+}
 
 // static
-void GstVideoPlayer::GstLibraryUnload() { gst_deinit(); }
+void GstVideoPlayer::GstLibraryUnload() {
+  gst_deinit();
+  UninstallTimestampedLogging();
+}
 
 bool GstVideoPlayer::Init() {
   LogPlaybackStartup("native_init_called");
@@ -1600,29 +1707,70 @@ bool GstVideoPlayer::CreatePipeline() {
 }
 
 bool GstVideoPlayer::Preroll() {
-  auto result = gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
-  if (result == GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "Preroll: Failed to change state to PAUSED" << std::endl;
+  // plughw is commonly exclusive on embedded images. If a rapid reconnect
+  // collides with the previous pipeline (or another audio client), retry once
+  // with a silent sink so an audio collision does not kill video playback.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    audio_device_busy_.store(false);
+    auto result = gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
+    const bool busy = audio_device_busy_.load();
+    if (result == GST_STATE_CHANGE_FAILURE || busy) {
+      if (busy && !audio_disabled_ && attempt == 0 && DisableAudioSink()) {
+        std::cerr << "Preroll: ALSA device busy; retrying video without audio"
+                  << std::endl;
+        continue;
+      }
+      std::cerr << "Preroll: Failed to change state to PAUSED" << std::endl;
+      return false;
+    }
+
+    // NO_PREROLL (live source) and ASYNC are both acceptable — not errors.
+    // NO_PREROLL is GStreamer's authoritative "this source is LIVE" signal.
+    GstState state;
+    gst_element_get_state(gst_.pipeline, &state, NULL, 5 * GST_SECOND);
+    if (audio_device_busy_.load() && !audio_disabled_ && attempt == 0 &&
+        DisableAudioSink()) {
+      std::cerr << "Preroll: ALSA device became busy; retrying video without "
+                   "audio"
+                << std::endl;
+      continue;
+    }
+    if (audio_device_busy_.load()) return false;
+
+    if (result == GST_STATE_CHANGE_NO_PREROLL && !stream_type_is_explicit_) {
+      is_live_ = true;
+      std::cout
+          << "PREROLL: live source (NO_PREROLL) — EOS will not complete/seek"
+          << std::endl;
+    } else if (result == GST_STATE_CHANGE_NO_PREROLL && !is_live_) {
+      std::cout << "PREROLL: NO_PREROLL ignored because stream type is explicitly "
+                   "onDemand"
+                << std::endl;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool GstVideoPlayer::DisableAudioSink() {
+  if (!gst_.pipeline || !gst_.playbin || audio_disabled_) return false;
+
+  // Wait for alsasink to release its file descriptor before replacing it.
+  gst_element_set_state(gst_.pipeline, GST_STATE_NULL);
+  gst_element_get_state(gst_.pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
+
+  GstElement* silent_sink =
+      gst_element_factory_make("fakesink", "audio_disabled");
+  if (!silent_sink) {
+    std::cerr << "Preroll: failed to create silent audio fallback" << std::endl;
     return false;
   }
-  // NO_PREROLL (live source) and ASYNC are both acceptable — not errors.
-  // NO_PREROLL is GStreamer's authoritative "this source is LIVE" signal — far
-  // more reliable than a duration/seekable heuristic (a live HLS playlist still
-  // reports a small sliding-window duration, which looks like VOD). Capture it
-  // so EOS handling never treats a live stream as "completed".
-  if (result == GST_STATE_CHANGE_NO_PREROLL && !stream_type_is_explicit_) {
-    is_live_ = true;
-    std::cout
-        << "PREROLL: live source (NO_PREROLL) — EOS will not complete/seek"
-        << std::endl;
-  } else if (result == GST_STATE_CHANGE_NO_PREROLL && !is_live_) {
-    std::cout << "PREROLL: NO_PREROLL ignored because stream type is explicitly "
-                 "onDemand"
-              << std::endl;
-  }
-  // Give GStreamer up to 5 s to settle before Init() advances to PLAYING.
-  GstState state;
-  gst_element_get_state(gst_.pipeline, &state, NULL, 5 * GST_SECOND);
+  g_object_set(silent_sink, "sync", FALSE, "async", FALSE, NULL);
+  g_object_set(gst_.playbin, "audio-sink", silent_sink, NULL);
+  gst_object_unref(silent_sink);
+  audio_volume_ = nullptr;
+  audio_disabled_ = true;
+  audio_device_busy_.store(false);
   return true;
 }
 
@@ -3237,6 +3385,15 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
                 << error_msg;
       if (debug && debug[0]) std::cout << "\n  debug: " << debug;
       std::cout << std::endl;
+      // Let Preroll() handle a temporary exclusive-device collision. Sending
+      // this to Dart immediately would trigger a reconnect before the native
+      // silent-audio fallback can retry the same pipeline.
+      if (IsAlsaDeviceBusy(error, debug)) {
+        self->audio_device_busy_.store(true);
+        g_free(debug);
+        g_error_free(error);
+        break;
+      }
       if (IsHttpUnavailable(error, debug)) {
         error_msg = std::string(kStreamUnavailablePrefix) + error_msg;
       } else if (IsChannelUnavailable(message, error, debug)) {

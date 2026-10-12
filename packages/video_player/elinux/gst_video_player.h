@@ -102,6 +102,7 @@ class GstVideoPlayer {
   std::string ParseUri(const std::string& uri);
   bool CreatePipeline();
   void DestroyPipeline();
+  bool DisableAudioSink();
   bool Preroll();
   void GetVideoSize(int32_t& width, int32_t& height);
   void StartWatchdog();
@@ -153,6 +154,11 @@ class GstVideoPlayer {
   // bin doesn't implement one), and mute silently no-ops. Driving this
   // element directly gives us a working mute during the preroll gate.
   GstElement* audio_volume_ = nullptr;
+  // ALSA playback devices are often exclusive on embedded images. If another
+  // process (or a just-torn-down reconnect) owns the device, keep video alive
+  // with a silent sink instead of failing the whole pipeline.
+  bool audio_disabled_ = false;
+  std::atomic<bool> audio_device_busy_{false};
   std::string uri_;
   std::vector<std::string> supported_video_codecs_;
   // Private metadata parsed from the `#soatv:` URI fragment. startup_kbps
