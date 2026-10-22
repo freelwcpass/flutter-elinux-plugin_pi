@@ -16,7 +16,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <atomic>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -74,10 +73,7 @@ class VideoPlayerPlugin : public flutter::Plugin {
     // DisposePlayer() erases from players_ itself and parks the shell in
     // retired_players_, so snapshot the ids first and don't erase here.
     std::vector<int64_t> texture_ids;
-    texture_ids.reserve(players_.size());
-    for (const auto& entry : players_) {
-      texture_ids.push_back(entry.first);
-    }
+    texture_ids = PlayerIds();
     for (const auto texture_id : texture_ids) {
       DisposePlayer(texture_id);
     }
@@ -86,23 +82,46 @@ class VideoPlayerPlugin : public flutter::Plugin {
     // now (deferred at dispose per task #38) before dropping the shells and
     // unloading the library — at shutdown there is no raster thread still
     // rendering to race against, so it is safe to unregister immediately.
-    for (auto& retired : retired_players_) {
-      texture_registrar_->UnregisterTexture(retired.second->texture_id);
+    std::vector<std::shared_ptr<FlutterVideoPlayer>> retired_players;
+    {
+      std::lock_guard<std::mutex> guard(players_mutex_);
+      for (auto& retired : retired_players_) {
+        retired_players.push_back(retired.second);
+      }
+      retired_players_.clear();
     }
-    retired_players_.clear();
+    for (const auto& retired : retired_players) {
+      texture_registrar_->UnregisterTexture(retired->texture_id);
+    }
     GstVideoPlayer::GstLibraryUnload();
   }
 
  private:
   struct FlutterVideoPlayer {
     int64_t texture_id;
-    std::unique_ptr<GstVideoPlayer> player;
+    // Shared ownership lets callbacks keep the native player alive while a
+    // disposal/reconnect removes it from the plugin registry. The registry
+    // owns the normal lifetime; an in-flight texture callback may hold the
+    // last reference until Flutter releases the returned pixel buffer.
+    std::shared_ptr<GstVideoPlayer> player;
     std::unique_ptr<flutter::TextureVariant> texture;
     std::unique_ptr<FlutterDesktopPixelBuffer> buffer;
     // Serialises the pixel-buffer copy (and the engine's subsequent
     // glTexImage2D read, released via the buffer's release_callback) against
     // DisposePlayer() tearing down `player`. See DisposePlayer().
     std::mutex buffer_mutex;
+    std::shared_ptr<GstVideoPlayer> in_flight_player;
+    std::mutex player_mutex;
+
+    std::shared_ptr<GstVideoPlayer> GetPlayer() {
+      std::lock_guard<std::mutex> guard(player_mutex);
+      return player;
+    }
+
+    void ClearPlayer() {
+      std::lock_guard<std::mutex> guard(player_mutex);
+      player.reset();
+    }
     // Flutter posts both a raster task and a UI frame for every
     // MarkTextureFrameAvailable call. Keep at most one notification in flight
     // so a sustained live stream cannot build an input-blocking task backlog.
@@ -173,6 +192,8 @@ class VideoPlayerPlugin : public flutter::Plugin {
 
   void DisposePlayer(int64_t texture_id);
   void ReapRetiredPlayers();
+  std::shared_ptr<FlutterVideoPlayer> FindPlayer(int64_t texture_id);
+  std::vector<int64_t> PlayerIds();
 
   flutter::EncodableValue WrapError(const std::string& message,
                                     const std::string& code = std::string(),
@@ -182,6 +203,7 @@ class VideoPlayerPlugin : public flutter::Plugin {
 
   flutter::PluginRegistrar* plugin_registrar_;
   flutter::TextureRegistrar* texture_registrar_;
+  std::mutex players_mutex_;
   std::unordered_map<int64_t, std::shared_ptr<FlutterVideoPlayer>> players_;
   // Disposed players whose FlutterVideoPlayer shell is kept alive briefly after
   // UnregisterTexture(): the deprecated synchronous UnregisterTexture(int64_t)
@@ -330,11 +352,7 @@ void VideoPlayerPlugin::HandleInitializeMethodCall(
   // on a hot restart.
   // https://github.com/flutter/flutter/issues/10437
   // DisposePlayer() erases from players_ itself, so snapshot the ids first.
-  std::vector<int64_t> texture_ids;
-  texture_ids.reserve(players_.size());
-  for (const auto& entry : players_) {
-    texture_ids.push_back(entry.first);
-  }
+  std::vector<int64_t> texture_ids = PlayerIds();
   for (const auto texture_id : texture_ids) {
     DisposePlayer(texture_id);
   }
@@ -376,13 +394,14 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
               void* egl_context) -> const FlutterDesktopEGLImage* {
             instance->texture_frame_pending.store(
                 false, std::memory_order_release);
-            if (!instance->player) {
+            std::shared_ptr<GstVideoPlayer> player = instance->GetPlayer();
+            if (!player) {
               return nullptr;
             }
-            instance->egl_image->width = instance->player->GetWidth();
-            instance->egl_image->height = instance->player->GetHeight();
+            instance->egl_image->width = player->GetWidth();
+            instance->egl_image->height = player->GetHeight();
             instance->egl_image->egl_image =
-                instance->player->GetEGLImage(egl_display, egl_context);
+                player->GetEGLImage(egl_display, egl_context);
             return instance->egl_image.get();
           }));
 #else
@@ -408,20 +427,32 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             if (!instance->buffer_mutex.try_lock()) {
               return nullptr;
             }
-            if (!instance->player) {
+            std::shared_ptr<GstVideoPlayer> player = instance->GetPlayer();
+            if (!player) {
               instance->buffer_mutex.unlock();
               return nullptr;
             }
-            const uint8_t* frame = instance->player->GetFrameBuffer();
+            // Keep the native player alive until Flutter invokes the release
+            // callback. The engine may read the returned pixel pointer after
+            // this callback returns.
+            instance->in_flight_player = player;
+            const uint8_t* frame = player->GetFrameBuffer();
             if (!frame) {
+              instance->in_flight_player.reset();
               instance->buffer_mutex.unlock();
               return nullptr;
             }
-            instance->buffer->width = instance->player->GetWidth();
-            instance->buffer->height = instance->player->GetHeight();
+            instance->buffer->width = player->GetWidth();
+            instance->buffer->height = player->GetHeight();
             instance->buffer->buffer = frame;
             instance->buffer->release_callback = [](void* ctx) {
-              static_cast<FlutterVideoPlayer*>(ctx)->buffer_mutex.unlock();
+              auto* player = static_cast<FlutterVideoPlayer*>(ctx);
+              // Drop the final native-player reference only after releasing
+              // buffer_mutex. GstVideoPlayer destruction can stop GStreamer
+              // callbacks and must never run while the texture lock is held.
+              std::shared_ptr<GstVideoPlayer> in_flight;
+              in_flight.swap(player->in_flight_player);
+              player->buffer_mutex.unlock();
             };
             instance->buffer->release_context = instance;
             return instance->buffer.get();
@@ -454,14 +485,15 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
               replayed_error = true;
             }
           }
-          if (instance->player) {
-            instance->player->LogPlaybackStartup(
+          if (auto player = instance->GetPlayer()) {
+            player->LogPlaybackStartup(
                 "plugin_event_channel_listening");
           }
           // If native initialization already completed before Dart attached,
           // replay the event now. Otherwise Init() will send it when the first
           // frame and startup buffer gate are ready.
-          if (!replayed_error && instance->player->IsInitialized()) {
+          auto player = instance->GetPlayer();
+          if (!replayed_error && player && player->IsInitialized()) {
             host->SendInitializedEventMessage(instance->texture_id);
           }
           return nullptr;
@@ -509,20 +541,26 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
         },
         // OnNotifyBufferingStart
         [texture_id, host = this]() {
-          if (host->players_.find(texture_id) != host->players_.end() &&
-              host->players_[texture_id]->event_sink) {
+          auto instance = host->FindPlayer(texture_id);
+          if (instance) {
+            std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
+            if (!instance->event_sink) return;
             flutter::EncodableMap encodables = {
                 {flutter::EncodableValue("event"),
                  flutter::EncodableValue("bufferingStart")}};
             flutter::EncodableValue event(encodables);
-            host->players_[texture_id]->event_sink->Success(event);
+            instance->event_sink->Success(event);
           }
         },
         // OnNotifyBufferingUpdate
         [texture_id, host = this](int percent) {
-          if (host->players_.find(texture_id) != host->players_.end() &&
-              host->players_[texture_id]->event_sink) {
-            auto duration = host->players_[texture_id]->player->GetDuration();
+          auto instance = host->FindPlayer(texture_id);
+          if (instance) {
+            std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
+            if (!instance->event_sink) return;
+            auto player = instance->GetPlayer();
+            if (!player) return;
+            auto duration = player->GetDuration();
             if (duration < 0) duration = 0;
             int64_t buffered_end = (duration * percent) / 100;
 
@@ -536,23 +574,25 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
                 {flutter::EncodableValue("values"),
                  flutter::EncodableValue(ranges)}};
             flutter::EncodableValue event(encodables);
-            host->players_[texture_id]->event_sink->Success(event);
+            instance->event_sink->Success(event);
           }
         },
         // OnNotifyBufferingEnd
         [texture_id, host = this]() {
-          if (host->players_.find(texture_id) != host->players_.end() &&
-              host->players_[texture_id]->event_sink) {
+          auto instance = host->FindPlayer(texture_id);
+          if (instance) {
+            std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
+            if (!instance->event_sink) return;
             flutter::EncodableMap encodables = {
                 {flutter::EncodableValue("event"),
                  flutter::EncodableValue("bufferingEnd")}};
             flutter::EncodableValue event(encodables);
-            host->players_[texture_id]->event_sink->Success(event);
+            instance->event_sink->Success(event);
           }
         });
 
     instance->player =
-        std::make_unique<GstVideoPlayer>(
+        std::make_shared<GstVideoPlayer>(
             uri, std::move(player_handler), meta.GetSupportedVideoCodecs());
 
     // Extract and apply HTTP headers dynamically
@@ -568,19 +608,33 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
 
       // Pass ALL headers to the player
       std::cout << "Setting ALL HTTP headers on player" << std::endl;
-      instance->player->SetAuthHeaders(http_headers);
+      if (auto player = instance->GetPlayer()) {
+        player->SetAuthHeaders(http_headers);
+      }
     } else {
       std::cout << "No HTTP headers provided from Flutter" << std::endl;
     }
 
-    players_[texture_id] = std::move(instance);
+    {
+      std::lock_guard<std::mutex> guard(players_mutex_);
+      players_[texture_id] = std::move(instance);
+    }
   }
 
   flutter::EncodableMap value;
   TextureMessage result;
 
-  auto player_entry = players_[texture_id];
-  player_entry->player->LogPlaybackStartup("plugin_create_reply_ready");
+  auto player_entry = FindPlayer(texture_id);
+  if (!player_entry || !player_entry->GetPlayer()) {
+    result.SetTextureId(texture_id);
+    value.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
+                  result.ToMap());
+    reply(flutter::EncodableValue(value));
+    return;
+  }
+  auto player = player_entry->GetPlayer();
+  if (!player) return;
+  player->LogPlaybackStartup("plugin_create_reply_ready");
   result.SetTextureId(texture_id);
   value.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
                 result.ToMap());
@@ -588,16 +642,18 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
   // Do not block the platform message handler on GStreamer preroll. The Dart
   // video controller subscribes to the EventChannel only after this reply;
   // keeping Init() synchronous created the multi-second event-channel gap.
-  player_entry->player->LogPlaybackStartup("plugin_init_call_started");
+  player->LogPlaybackStartup("plugin_init_call_started");
   player_entry->initialization_thread = std::thread(
       [player_entry, texture_id]() {
-        player_entry->player->LogPlaybackStartup("plugin_async_init_started");
-        const bool ok = player_entry->player->Init();
-        player_entry->player->LogPlaybackStartup(
+        auto player = player_entry->GetPlayer();
+        if (!player) return;
+        player->LogPlaybackStartup("plugin_async_init_started");
+        const bool ok = player->Init();
+        player->LogPlaybackStartup(
             "plugin_init_returned",
             std::string("success=") + (ok ? "true" : "false"));
         if (!ok) {
-          const std::string specific = player_entry->player->GetLastError();
+          const std::string specific = player->GetLastError();
           const std::string error_message =
               !specific.empty()
                   ? specific
@@ -617,7 +673,7 @@ void VideoPlayerPlugin::HandleDisposeMethodCall(
   const auto texture_id = parameter.GetTextureId();
   flutter::EncodableMap result;
 
-  if (players_.find(texture_id) != players_.end()) {
+  if (FindPlayer(texture_id)) {
     // DisposePlayer() erases from players_ itself.
     DisposePlayer(texture_id);
     result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
@@ -638,11 +694,11 @@ void VideoPlayerPlugin::HandlePauseMethodCall(
   const auto texture_id = parameter.GetTextureId();
   flutter::EncodableMap result;
 
-  if (players_.find(texture_id) != players_.end()) {
+  if (auto instance = FindPlayer(texture_id)) {
     // Diagnostic: a pipeline stuck in PAUSED traces back to whoever sent this.
     std::cout << "PAUSE method call from Dart for texture " << texture_id
               << std::endl;
-    players_[texture_id]->player->Pause();
+    if (auto player = instance->GetPlayer()) player->Pause();
     result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
                    flutter::EncodableValue());
   } else {
@@ -661,8 +717,8 @@ void VideoPlayerPlugin::HandlePlayMethodCall(
   const auto texture_id = parameter.GetTextureId();
   flutter::EncodableMap result;
 
-  if (players_.find(texture_id) != players_.end()) {
-    players_[texture_id]->player->Play();
+  if (auto instance = FindPlayer(texture_id)) {
+    if (auto player = instance->GetPlayer()) player->Play();
     result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
                    flutter::EncodableValue());
   } else {
@@ -681,8 +737,9 @@ void VideoPlayerPlugin::HandleSetLoopingMethodCall(
   const auto texture_id = parameter.GetTextureId();
   flutter::EncodableMap result;
 
-  if (players_.find(texture_id) != players_.end()) {
-    players_[texture_id]->player->SetAutoRepeat(parameter.GetIsLooping());
+  if (auto instance = FindPlayer(texture_id)) {
+    if (auto player = instance->GetPlayer())
+      player->SetAutoRepeat(parameter.GetIsLooping());
     result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
                    flutter::EncodableValue());
   } else {
@@ -701,8 +758,9 @@ void VideoPlayerPlugin::HandleSetVolumeMethodCall(
   const auto texture_id = parameter.GetTextureId();
   flutter::EncodableMap result;
 
-  if (players_.find(texture_id) != players_.end()) {
-    players_[texture_id]->player->SetVolume(parameter.GetVolume());
+  if (auto instance = FindPlayer(texture_id)) {
+    if (auto player = instance->GetPlayer())
+      player->SetVolume(parameter.GetVolume());
     result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
                    flutter::EncodableValue());
   } else {
@@ -732,8 +790,16 @@ void VideoPlayerPlugin::HandlePositionMethodCall(
   const auto texture_id = parameter.GetTextureId();
   flutter::EncodableMap result;
 
-  if (players_.find(texture_id) != players_.end()) {
-    auto position = players_[texture_id]->player->GetCurrentPosition();
+  if (auto instance = FindPlayer(texture_id)) {
+    auto player = instance->GetPlayer();
+    if (!player) {
+      result.emplace(flutter::EncodableValue(kEncodableMapkeyError),
+                     flutter::EncodableValue(WrapError(
+                         "Player is being disposed", "player_disposed")));
+      reply(flutter::EncodableValue(result));
+      return;
+    }
+    auto position = player->GetCurrentPosition();
     // Treat negative positions as 0 instead of returning an error.
     // This can happen during initial buffering or transient GStreamer states.
     if (position < 0) {
@@ -764,8 +830,9 @@ void VideoPlayerPlugin::HandleSetPlaybackSpeedMethodCall(
   const auto texture_id = parameter.GetTextureId();
   flutter::EncodableMap result;
 
-  if (players_.find(texture_id) != players_.end()) {
-    players_[texture_id]->player->SetPlaybackRate(parameter.GetSpeed());
+  if (auto instance = FindPlayer(texture_id)) {
+    if (auto player = instance->GetPlayer())
+      player->SetPlaybackRate(parameter.GetSpeed());
     result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
                    flutter::EncodableValue());
   } else {
@@ -784,8 +851,9 @@ void VideoPlayerPlugin::HandleSeekToMethodCall(
   const auto texture_id = parameter.GetTextureId();
   flutter::EncodableMap result;
 
-  if (players_.find(texture_id) != players_.end()) {
-    if (players_[texture_id]->player->SetSeek(parameter.GetPosition())) {
+  if (auto instance = FindPlayer(texture_id)) {
+    auto player = instance->GetPlayer();
+    if (player && player->SetSeek(parameter.GetPosition())) {
       result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
                      flutter::EncodableValue());
     } else {
@@ -804,28 +872,28 @@ void VideoPlayerPlugin::HandleSeekToMethodCall(
 }
 
 void VideoPlayerPlugin::SendInitializedEventMessage(int64_t texture_id) {
-  if (players_.find(texture_id) == players_.end()) {
-    return;
-  }
-  const auto instance = players_[texture_id];
+  const auto instance = FindPlayer(texture_id);
+  if (!instance) return;
   std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
   if (instance->error_reported.load()) return;
+  auto player = instance->GetPlayer();
+  if (!player) return;
 
-  players_[texture_id]->player->LogPlaybackStartup(
+  player->LogPlaybackStartup(
       "plugin_initialized_event_attempt",
       std::string("sinkReady=") +
-          (players_[texture_id]->event_sink ? "true" : "false"));
-  if (!players_[texture_id]->event_sink) return;
-  if (!players_[texture_id]->player->IsInitialized()) return;
+          (instance->event_sink ? "true" : "false"));
+  if (!instance->event_sink) return;
+  if (!player->IsInitialized()) return;
   bool expected = false;
-  if (!players_[texture_id]->initialized_event_sent.compare_exchange_strong(
+  if (!instance->initialized_event_sent.compare_exchange_strong(
           expected, true)) {
     return;
   }
 
-  auto duration = players_[texture_id]->player->GetDuration();
-  auto width = players_[texture_id]->player->GetWidth();
-  auto height = players_[texture_id]->player->GetHeight();
+  auto duration = player->GetDuration();
+  auto width = player->GetWidth();
+  auto height = player->GetHeight();
   flutter::EncodableMap encodables = {
       {flutter::EncodableValue("event"),
        flutter::EncodableValue("initialized")},
@@ -833,29 +901,28 @@ void VideoPlayerPlugin::SendInitializedEventMessage(int64_t texture_id) {
       {flutter::EncodableValue("width"), flutter::EncodableValue(width)},
       {flutter::EncodableValue("height"), flutter::EncodableValue(height)}};
   flutter::EncodableValue event(encodables);
-  players_[texture_id]->event_sink->Success(event);
-  players_[texture_id]->player->LogPlaybackStartup(
-      "plugin_initialized_event_sent");
+  instance->event_sink->Success(event);
+  player->LogPlaybackStartup("plugin_initialized_event_sent");
 }
 
 void VideoPlayerPlugin::SendPlayCompletedEventMessage(int64_t texture_id) {
-  if (players_.find(texture_id) == players_.end() ||
-      !players_[texture_id]->event_sink) {
-    return;
-  }
+  const auto instance = FindPlayer(texture_id);
+  if (!instance) return;
+  std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
+  if (!instance->event_sink) return;
 
   flutter::EncodableMap encodables = {
       {flutter::EncodableValue("event"), flutter::EncodableValue("completed")}};
   flutter::EncodableValue event(encodables);
-  players_[texture_id]->event_sink->Success(event);
+  instance->event_sink->Success(event);
 }
 
 void VideoPlayerPlugin::SendIsPlayingStateUpdate(int64_t texture_id,
                                                  bool is_playing) {
-  if (players_.find(texture_id) == players_.end() ||
-      !players_[texture_id]->event_sink) {
-    return;
-  }
+  const auto instance = FindPlayer(texture_id);
+  if (!instance) return;
+  std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
+  if (!instance->event_sink) return;
 
   flutter::EncodableMap encodables = {
       {flutter::EncodableValue("event"),
@@ -863,25 +930,43 @@ void VideoPlayerPlugin::SendIsPlayingStateUpdate(int64_t texture_id,
       {flutter::EncodableValue("isPlaying"),
        flutter::EncodableValue(is_playing)}};
   flutter::EncodableValue event(encodables);
-  players_[texture_id]->event_sink->Success(event);
+  instance->event_sink->Success(event);
 }
 
 void VideoPlayerPlugin::SendErrorEventMessage(int64_t texture_id,
                                               const std::string& message) {
-  const auto it = players_.find(texture_id);
-  if (it == players_.end()) return;
-  const auto instance = it->second;
+  const auto instance = FindPlayer(texture_id);
+  if (!instance) return;
   // Init can fail before Dart subscribes. Retain errors until it attaches.
   instance->DeliverError(message);
 }
 
-void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
-  auto it = players_.find(texture_id);
-  if (it == players_.end()) {
-    return;
+std::shared_ptr<VideoPlayerPlugin::FlutterVideoPlayer>
+VideoPlayerPlugin::FindPlayer(int64_t texture_id) {
+  std::lock_guard<std::mutex> guard(players_mutex_);
+  const auto it = players_.find(texture_id);
+  return it == players_.end() ? nullptr : it->second;
+}
+
+std::vector<int64_t> VideoPlayerPlugin::PlayerIds() {
+  std::lock_guard<std::mutex> guard(players_mutex_);
+  std::vector<int64_t> texture_ids;
+  texture_ids.reserve(players_.size());
+  for (const auto& entry : players_) {
+    texture_ids.push_back(entry.first);
   }
-  std::shared_ptr<FlutterVideoPlayer> player = it->second;
-  players_.erase(it);
+  return texture_ids;
+}
+
+void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
+  std::shared_ptr<FlutterVideoPlayer> player;
+  {
+    std::lock_guard<std::mutex> guard(players_mutex_);
+    auto it = players_.find(texture_id);
+    if (it == players_.end()) return;
+    player = it->second;
+    players_.erase(it);
+  }
 
   // Init() runs asynchronously; finish it before releasing the Gst player.
   if (player->initialization_thread.joinable() &&
@@ -907,7 +992,7 @@ void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
   // Nulling `player` also makes any copy that starts afterwards bail at once.
   {
     std::lock_guard<std::mutex> guard(player->buffer_mutex);
-    player->player = nullptr;
+    player->ClearPlayer();
   }
 
   // DEFERRED UNREGISTER (task #38, 2026-08-13). Do NOT call
@@ -934,13 +1019,19 @@ void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
   // silent-reconnect UX (PR #37) held an extra texture reference during
   // dispose. Deferring here breaks that race regardless of trigger.
   ReapRetiredPlayers();
-  retired_players_.emplace_back(std::chrono::steady_clock::now(),
-                                std::move(player));
+  {
+    std::lock_guard<std::mutex> guard(players_mutex_);
+    retired_players_.emplace_back(std::chrono::steady_clock::now(),
+                                  std::move(player));
+  }
 }
 
 void VideoPlayerPlugin::ReapRetiredPlayers() {
   const auto now = std::chrono::steady_clock::now();
-  for (auto it = retired_players_.begin(); it != retired_players_.end();) {
+  std::vector<std::shared_ptr<FlutterVideoPlayer>> expired;
+  {
+    std::lock_guard<std::mutex> guard(players_mutex_);
+    for (auto it = retired_players_.begin(); it != retired_players_.end();) {
     // 5 s is far longer than the few frames the engine needs to stop invoking
     // an unregistered texture's callback, so the shell is safe to free.
     if (now - it->first > std::chrono::seconds(5)) {
@@ -948,11 +1039,14 @@ void VideoPlayerPlugin::ReapRetiredPlayers() {
       // the engine that tears down its ExternalTexturePixelBuffer wrapper.
       // Delayed 5 s past DisposePlayer so raster-thread references from
       // in-flight render passes have drained.
-      texture_registrar_->UnregisterTexture(it->second->texture_id);
+      expired.push_back(it->second);
       it = retired_players_.erase(it);
     } else {
       ++it;
     }
+  }
+  for (const auto& player : expired) {
+    texture_registrar_->UnregisterTexture(player->texture_id);
   }
 }
 
