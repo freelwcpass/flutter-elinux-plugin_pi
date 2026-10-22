@@ -1032,17 +1032,18 @@ void VideoPlayerPlugin::ReapRetiredPlayers() {
   {
     std::lock_guard<std::mutex> guard(players_mutex_);
     for (auto it = retired_players_.begin(); it != retired_players_.end();) {
-    // 5 s is far longer than the few frames the engine needs to stop invoking
-    // an unregistered texture's callback, so the shell is safe to free.
-    if (now - it->first > std::chrono::seconds(5)) {
-      // Deferred UnregisterTexture (task #38). This is the actual call to
-      // the engine that tears down its ExternalTexturePixelBuffer wrapper.
-      // Delayed 5 s past DisposePlayer so raster-thread references from
-      // in-flight render passes have drained.
-      expired.push_back(it->second);
-      it = retired_players_.erase(it);
-    } else {
-      ++it;
+      // 5 s is far longer than the few frames the engine needs to stop invoking
+      // an unregistered texture's callback, so the shell is safe to free.
+      if (now - it->first > std::chrono::seconds(5)) {
+        // Deferred UnregisterTexture (task #38). This is the actual call to
+        // the engine that tears down its ExternalTexturePixelBuffer wrapper.
+        // Delayed 5 s past DisposePlayer so raster-thread references from
+        // in-flight render passes have drained.
+        expired.push_back(it->second);
+        it = retired_players_.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
   for (const auto& player : expired) {
