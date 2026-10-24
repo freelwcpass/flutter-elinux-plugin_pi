@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
@@ -374,6 +375,7 @@ class GstVideoPlayer {
   GstEGLImage* gst_egl_image_ = NULL;
   GstGLContext* gst_gl_ctx_ = NULL;
   GstGLDisplayEGL* gst_gl_display_egl_ = NULL;
+  uint64_t egl_diagnostic_frame_count_ = 0;
 #endif  // USE_EGL_IMAGE_DMABUF
 };
 

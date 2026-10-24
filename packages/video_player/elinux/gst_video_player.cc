@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -21,6 +22,14 @@
 #include <vector>
 
 namespace {
+bool VideoTextureDiagnosticsEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("SOA_VIDEO_TEXTURE_DIAGNOSTICS");
+    return value != nullptr && std::string(value) == "1";
+  }();
+  return enabled;
+}
+
 class TimestampedStreambuf final : public std::streambuf {
  public:
   explicit TimestampedStreambuf(std::streambuf* destination)
@@ -1109,19 +1118,35 @@ int64_t GstVideoPlayer::GetCurrentPosition() {
 
 #ifdef USE_EGL_IMAGE_DMABUF
 void* GstVideoPlayer::GetEGLImage(void* egl_display, void* egl_context) {
+  const bool diagnose = VideoTextureDiagnosticsEnabled();
+  const auto total_start = diagnose ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+  const uint64_t diagnostic_frame =
+      diagnose ? ++egl_diagnostic_frame_count_ : 0;
+
   // This runs from Flutter's raster thread. A frame handoff may briefly own
   // the writer lock; dropping one presentation frame is preferable to
   // blocking the entire UI (and delaying remote-driven overlays).
   std::shared_lock<std::shared_mutex> lock(mutex_buffer_, std::try_to_lock);
   if (!lock.owns_lock()) {
+    if (diagnose && diagnostic_frame % 30 == 0) {
+      std::cerr << "[VideoTextureDiag] frame=" << diagnostic_frame
+                << " result=buffer_lock_busy" << std::endl;
+    }
     return nullptr;
   }
   if (!gst_.buffer) {
+    if (diagnose && diagnostic_frame % 30 == 0) {
+      std::cerr << "[VideoTextureDiag] frame=" << diagnostic_frame
+                << " result=no_buffer" << std::endl;
+    }
     return nullptr;
   }
 
   GstMemory* memory = gst_buffer_peek_memory(gst_.buffer, 0);
   if (gst_is_dmabuf_memory(memory)) {
+    const auto setup_start = diagnose ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     UnrefEGLImage();
 
     gint fd = gst_dmabuf_memory_get_fd(memory);
@@ -1134,9 +1159,40 @@ void* GstVideoPlayer::GetEGLImage(void* egl_display, void* egl_context) {
 
     gst_gl_context_activate(gst_gl_ctx_, TRUE);
 
+    const auto import_start = diagnose ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
     gst_egl_image_ =
         gst_egl_image_from_dmabuf(gst_gl_ctx_, fd, &gst_video_info_, 0, 0);
-    return reinterpret_cast<void*>(gst_egl_image_get_image(gst_egl_image_));
+    const auto end = diagnose ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
+    void* image = gst_egl_image_get_image(gst_egl_image_);
+    if (diagnose && diagnostic_frame % 30 == 0) {
+      const auto setup_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                import_start - setup_start)
+                                .count();
+      const auto import_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 end - import_start)
+                                 .count();
+      const auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                end - total_start)
+                                .count();
+      std::cerr << "[VideoTextureDiag] frame=" << diagnostic_frame
+                << " source=" << width_ << "x" << height_
+                << " setupUs=" << setup_us << " importUs=" << import_us
+                << " totalUs=" << total_us
+                << " image=" << (image != nullptr ? "ok" : "null")
+                << std::endl;
+    }
+    return image;
+  }
+
+  if (diagnose && diagnostic_frame % 30 == 0) {
+    const auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - total_start)
+                              .count();
+    std::cerr << "[VideoTextureDiag] frame=" << diagnostic_frame
+              << " source=" << width_ << "x" << height_
+              << " result=not_dmabuf totalUs=" << total_us << std::endl;
   }
   return nullptr;
 }
