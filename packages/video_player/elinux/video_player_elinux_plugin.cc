@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -126,6 +127,13 @@ class VideoPlayerPlugin : public flutter::Plugin {
     // MarkTextureFrameAvailable call. Keep at most one notification in flight
     // so a sustained live stream cannot build an input-blocking task backlog.
     std::atomic<bool> texture_frame_pending{false};
+    // Diagnostic counters for the PixelBufferTexture path used by the current
+    // eLinux build. Emit one sample every 30 callbacks without requiring a
+    // runtime environment variable on the box.
+    std::atomic<uint64_t> pixel_buffer_diagnostic_frames{0};
+    uint64_t pixel_buffer_in_flight_frame = 0;
+    std::chrono::steady_clock::time_point pixel_buffer_returned_at;
+    int64_t pixel_buffer_callback_us = 0;
 #ifdef USE_EGL_IMAGE_DMABUF
     std::unique_ptr<FlutterDesktopEGLImage> egl_image;
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -410,6 +418,9 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
       std::make_unique<flutter::TextureVariant>(flutter::PixelBufferTexture(
           [instance = instance.get()](
               size_t width, size_t height) -> const FlutterDesktopPixelBuffer* {
+            const auto callback_started = std::chrono::steady_clock::now();
+            const uint64_t diagnostic_frame =
+                ++instance->pixel_buffer_diagnostic_frames;
             instance->texture_frame_pending.store(
                 false, std::memory_order_release);
             // Hold buffer_mutex across the whole copy AND the engine's later
@@ -425,10 +436,25 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             // next decoded frame arrives. Blocking here delays every Flutter
             // overlay, including remote-driven media controls.
             if (!instance->buffer_mutex.try_lock()) {
+              if (diagnostic_frame % 30 == 0) {
+                const auto callback_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - callback_started)
+                        .count();
+                std::cerr << "[VideoTextureDiag] path=pixel_buffer frame="
+                          << diagnostic_frame
+                          << " result=buffer_lock_busy callbackUs="
+                          << callback_us << std::endl;
+              }
               return nullptr;
             }
             std::shared_ptr<GstVideoPlayer> player = instance->GetPlayer();
             if (!player) {
+              if (diagnostic_frame % 30 == 0) {
+                std::cerr << "[VideoTextureDiag] path=pixel_buffer frame="
+                          << diagnostic_frame << " result=no_player"
+                          << std::endl;
+              }
               instance->buffer_mutex.unlock();
               return nullptr;
             }
@@ -438,6 +464,11 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             instance->in_flight_player = player;
             const uint8_t* frame = player->GetFrameBuffer();
             if (!frame) {
+              if (diagnostic_frame % 30 == 0) {
+                std::cerr << "[VideoTextureDiag] path=pixel_buffer frame="
+                          << diagnostic_frame << " result=no_frame"
+                          << std::endl;
+              }
               instance->in_flight_player.reset();
               instance->buffer_mutex.unlock();
               return nullptr;
@@ -445,8 +476,37 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             instance->buffer->width = player->GetWidth();
             instance->buffer->height = player->GetHeight();
             instance->buffer->buffer = frame;
+            instance->pixel_buffer_in_flight_frame = diagnostic_frame;
+            instance->pixel_buffer_returned_at =
+                std::chrono::steady_clock::now();
+            instance->pixel_buffer_callback_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    instance->pixel_buffer_returned_at - callback_started)
+                    .count();
+            if (diagnostic_frame % 30 == 0) {
+              std::cerr << "[VideoTextureDiag] path=pixel_buffer frame="
+                        << diagnostic_frame << " source="
+                        << instance->buffer->width << "x"
+                        << instance->buffer->height << " callbackUs="
+                        << instance->pixel_buffer_callback_us << std::endl;
+            }
             instance->buffer->release_callback = [](void* ctx) {
               auto* player = static_cast<FlutterVideoPlayer*>(ctx);
+              const uint64_t diagnostic_frame =
+                  player->pixel_buffer_in_flight_frame;
+              if (diagnostic_frame % 30 == 0) {
+                const auto held_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() -
+                        player->pixel_buffer_returned_at)
+                        .count();
+                std::cerr << "[VideoTextureDiag] path=pixel_buffer frame="
+                          << diagnostic_frame << " source="
+                          << player->buffer->width << "x"
+                          << player->buffer->height << " callbackUs="
+                          << player->pixel_buffer_callback_us << " heldUs="
+                          << held_us << std::endl;
+              }
               // Drop the final native-player reference only after releasing
               // buffer_mutex. GstVideoPlayer destruction can stop GStreamer
               // callbacks and must never run while the texture lock is held.
