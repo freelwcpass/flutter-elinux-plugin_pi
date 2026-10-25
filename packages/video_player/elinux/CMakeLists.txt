@@ -6,11 +6,15 @@ project(${PROJECT_NAME} LANGUAGES CXX)
 # not be changed
 set(PLUGIN_NAME "video_player_elinux_plugin")
 
+# eLinux targets support the EGLImage/DMA-BUF texture path. Enable it by
+# default here because app-level Linux CMake files are not used by flutter-elinux.
+option(USE_EGL_IMAGE_DMABUF "Use EGLImage/DMA-BUF video textures" ON)
+
 find_package(PkgConfig)
 pkg_check_modules(GLIB REQUIRED glib-2.0)
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0)
 if(USE_EGL_IMAGE_DMABUF)
-pkg_check_modules(GSTREAMER_GL REQUIRED gstreamer-gl-1.0)
+  pkg_check_modules(GSTREAMER_GL REQUIRED gstreamer-gl-1.0)
 endif()
 
 add_library(${PLUGIN_NAME} SHARED
@@ -21,6 +25,9 @@ apply_standard_settings(${PLUGIN_NAME})
 set_target_properties(${PLUGIN_NAME} PROPERTIES
   CXX_VISIBILITY_PRESET hidden)
 target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)
+if(USE_EGL_IMAGE_DMABUF)
+  target_compile_definitions(${PLUGIN_NAME} PRIVATE USE_EGL_IMAGE_DMABUF)
+endif()
 target_include_directories(${PLUGIN_NAME} INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(${PLUGIN_NAME} PRIVATE flutter flutter_wrapper_plugin)
@@ -31,10 +38,10 @@ target_include_directories(${PLUGIN_NAME}
     ${GSTREAMER_INCLUDE_DIRS}
 )
 if(USE_EGL_IMAGE_DMABUF)
-target_include_directories(${PLUGIN_NAME}
-  PRIVATE
-    ${GSTREAMER_GL_INCLUDE_DIRS}
-)
+  target_include_directories(${PLUGIN_NAME}
+    PRIVATE
+      ${GSTREAMER_GL_INCLUDE_DIRS}
+  )
 endif()
 
 target_link_libraries(${PLUGIN_NAME}
@@ -43,10 +50,10 @@ target_link_libraries(${PLUGIN_NAME}
     ${GSTREAMER_LIBRARIES}
 )
 if(USE_EGL_IMAGE_DMABUF)
-target_link_libraries(${PLUGIN_NAME}
-  PRIVATE
-    ${GSTREAMER_GL_LIBRARIES}
-)
+  target_link_libraries(${PLUGIN_NAME}
+    PRIVATE
+      ${GSTREAMER_GL_LIBRARIES}
+  )
 endif()
 
 # List of absolute paths to libraries that should be bundled with the plugin
