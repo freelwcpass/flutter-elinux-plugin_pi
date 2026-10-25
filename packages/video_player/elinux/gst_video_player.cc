@@ -22,6 +22,7 @@
 #include <vector>
 
 namespace {
+#ifdef USE_EGL_IMAGE_DMABUF
 bool VideoTextureDiagnosticsEnabled() {
   static const bool enabled = [] {
     const char* value = std::getenv("SOA_VIDEO_TEXTURE_DIAGNOSTICS");
@@ -29,6 +30,7 @@ bool VideoTextureDiagnosticsEnabled() {
   }();
   return enabled;
 }
+#endif
 
 class TimestampedStreambuf final : public std::streambuf {
  public:
