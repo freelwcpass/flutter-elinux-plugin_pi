@@ -125,6 +125,9 @@ class VideoPlayerPlugin : public flutter::Plugin {
       std::atomic<uint64_t> copy_time_ns{0};
       std::atomic<uint64_t> copy_time_samples{0};
       std::atomic<uint64_t> copy_time_max_ns{0};
+      std::atomic<uint64_t> mark_to_callback_time_ns{0};
+      std::atomic<uint64_t> mark_to_callback_samples{0};
+      std::atomic<uint64_t> mark_to_callback_max_ns{0};
       std::atomic<uint64_t> buffer_hold_time_ns{0};
       std::atomic<uint64_t> buffer_hold_time_samples{0};
       std::atomic<uint64_t> buffer_hold_time_max_ns{0};
@@ -158,6 +161,7 @@ class VideoPlayerPlugin : public flutter::Plugin {
     // MarkTextureFrameAvailable call. Keep at most one notification in flight
     // so a sustained live stream cannot build an input-blocking task backlog.
     std::atomic<bool> texture_frame_pending{false};
+    std::atomic<int64_t> texture_mark_started_at_ns{-1};
     bool texture_diagnostics_enabled = false;
     std::atomic<bool> texture_diagnostics_stopping{false};
     std::mutex texture_diagnostics_wait_mutex;
@@ -436,11 +440,31 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
           [instance = instance.get()](
               size_t width, size_t height, void* egl_display,
               void* egl_context) -> const FlutterDesktopEGLImage* {
+            const int64_t mark_started_at_ns =
+                instance->texture_diagnostics_enabled
+                    ? instance->texture_mark_started_at_ns.exchange(
+                          -1, std::memory_order_relaxed)
+                    : -1;
             instance->texture_frame_pending.store(
                 false, std::memory_order_release);
             if (instance->texture_diagnostics_enabled) {
               instance->texture_diagnostics.texture_callbacks.fetch_add(
                   1, std::memory_order_relaxed);
+              if (mark_started_at_ns >= 0) {
+                const uint64_t latency_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count() -
+                    mark_started_at_ns);
+                instance->texture_diagnostics.mark_to_callback_time_ns
+                    .fetch_add(latency_ns, std::memory_order_relaxed);
+                instance->texture_diagnostics.mark_to_callback_samples
+                    .fetch_add(1, std::memory_order_relaxed);
+                RecordDiagnosticMaximum(
+                    instance->texture_diagnostics
+                        .mark_to_callback_max_ns,
+                    latency_ns);
+              }
             }
             std::shared_ptr<GstVideoPlayer> player = instance->GetPlayer();
             if (!player) {
@@ -471,11 +495,31 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
       std::make_unique<flutter::TextureVariant>(flutter::PixelBufferTexture(
           [instance = instance.get()](
               size_t width, size_t height) -> const FlutterDesktopPixelBuffer* {
+            const int64_t mark_started_at_ns =
+                instance->texture_diagnostics_enabled
+                    ? instance->texture_mark_started_at_ns.exchange(
+                          -1, std::memory_order_relaxed)
+                    : -1;
             instance->texture_frame_pending.store(
                 false, std::memory_order_release);
             if (instance->texture_diagnostics_enabled) {
               instance->texture_diagnostics.texture_callbacks.fetch_add(
                   1, std::memory_order_relaxed);
+              if (mark_started_at_ns >= 0) {
+                const uint64_t latency_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count() -
+                    mark_started_at_ns);
+                instance->texture_diagnostics.mark_to_callback_time_ns
+                    .fetch_add(latency_ns, std::memory_order_relaxed);
+                instance->texture_diagnostics.mark_to_callback_samples
+                    .fetch_add(1, std::memory_order_relaxed);
+                RecordDiagnosticMaximum(
+                    instance->texture_diagnostics
+                        .mark_to_callback_max_ns,
+                    latency_ns);
+              }
             }
             // Hold buffer_mutex across the whole copy AND the engine's later
             // glTexImage2D read: the engine reads the returned buffer after
@@ -645,11 +689,20 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             }
             return;
           }
+          if (instance->texture_diagnostics_enabled) {
+            instance->texture_mark_started_at_ns.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count(),
+                std::memory_order_relaxed);
+          }
           if (!host->texture_registrar_->MarkTextureFrameAvailable(
                   texture_id)) {
             if (instance->texture_diagnostics_enabled) {
               instance->texture_diagnostics.texture_mark_failed.fetch_add(
                   1, std::memory_order_relaxed);
+              instance->texture_mark_started_at_ns.store(
+                  -1, std::memory_order_relaxed);
             }
             instance->texture_frame_pending.store(
                 false, std::memory_order_release);
@@ -1163,6 +1216,12 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
         stats.copy_time_samples.exchange(0, std::memory_order_relaxed);
     const uint64_t copy_max_ns =
         stats.copy_time_max_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t mark_to_callback_time_ns =
+        stats.mark_to_callback_time_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t mark_to_callback_samples =
+        stats.mark_to_callback_samples.exchange(0, std::memory_order_relaxed);
+    const uint64_t mark_to_callback_max_ns =
+        stats.mark_to_callback_max_ns.exchange(0, std::memory_order_relaxed);
     const uint64_t hold_time_ns =
         stats.buffer_hold_time_ns.exchange(0, std::memory_order_relaxed);
     const uint64_t hold_samples =
@@ -1181,6 +1240,13 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
       line << " copy_avg_ms="
            << (static_cast<double>(copy_time_ns) / copy_samples / 1000000.0)
            << " copy_max_ms=" << (static_cast<double>(copy_max_ns) / 1000000.0);
+    }
+    if (mark_to_callback_samples > 0) {
+      line << " mark_to_callback_avg_ms="
+           << (static_cast<double>(mark_to_callback_time_ns) /
+               mark_to_callback_samples / 1000000.0)
+           << " mark_to_callback_max_ms="
+           << (static_cast<double>(mark_to_callback_max_ns) / 1000000.0);
     }
     if (hold_samples > 0) {
       line << " buffer_hold_avg_ms="
