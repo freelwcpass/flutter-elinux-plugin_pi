@@ -16,8 +16,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -56,6 +60,15 @@ constexpr char kVideoPlayerVideoEventsChannelName[] =
 
 constexpr char kEncodableMapkeyResult[] = "result";
 constexpr char kEncodableMapkeyError[] = "error";
+
+void RecordDiagnosticMaximum(std::atomic<uint64_t>& maximum,
+                             uint64_t value) {
+  uint64_t observed = maximum.load(std::memory_order_relaxed);
+  while (observed < value &&
+         !maximum.compare_exchange_weak(observed, value,
+                                        std::memory_order_relaxed)) {
+  }
+}
 
 class VideoPlayerPlugin : public flutter::Plugin {
  public:
@@ -98,6 +111,25 @@ class VideoPlayerPlugin : public flutter::Plugin {
 
  private:
   struct FlutterVideoPlayer {
+    struct TextureDiagnosticStats {
+      std::atomic<uint64_t> decoded_frames{0};
+      std::atomic<uint64_t> texture_marked{0};
+      std::atomic<uint64_t> texture_coalesced{0};
+      std::atomic<uint64_t> texture_mark_failed{0};
+      std::atomic<uint64_t> texture_callbacks{0};
+      std::atomic<uint64_t> texture_returned{0};
+      std::atomic<uint64_t> texture_lock_busy{0};
+      std::atomic<uint64_t> texture_no_player{0};
+      std::atomic<uint64_t> texture_no_frame{0};
+      std::atomic<uint64_t> buffer_releases{0};
+      std::atomic<uint64_t> copy_time_ns{0};
+      std::atomic<uint64_t> copy_time_samples{0};
+      std::atomic<uint64_t> copy_time_max_ns{0};
+      std::atomic<uint64_t> buffer_hold_time_ns{0};
+      std::atomic<uint64_t> buffer_hold_time_samples{0};
+      std::atomic<uint64_t> buffer_hold_time_max_ns{0};
+    } texture_diagnostics;
+
     int64_t texture_id;
     // Shared ownership lets callbacks keep the native player alive while a
     // disposal/reconnect removes it from the plugin registry. The registry
@@ -126,6 +158,12 @@ class VideoPlayerPlugin : public flutter::Plugin {
     // MarkTextureFrameAvailable call. Keep at most one notification in flight
     // so a sustained live stream cannot build an input-blocking task backlog.
     std::atomic<bool> texture_frame_pending{false};
+    bool texture_diagnostics_enabled = false;
+    std::atomic<bool> texture_diagnostics_stopping{false};
+    std::mutex texture_diagnostics_wait_mutex;
+    std::condition_variable texture_diagnostics_wait_cv;
+    std::thread texture_diagnostics_thread;
+    std::chrono::steady_clock::time_point texture_buffer_returned_at;
 #ifdef USE_EGL_IMAGE_DMABUF
     std::unique_ptr<FlutterDesktopEGLImage> egl_image;
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -191,6 +229,12 @@ class VideoPlayerPlugin : public flutter::Plugin {
   void SendErrorEventMessage(int64_t texture_id, const std::string& message);
 
   void DisposePlayer(int64_t texture_id);
+  void StartTextureDiagnostics(
+      const std::shared_ptr<FlutterVideoPlayer>& player);
+  void StopTextureDiagnostics(
+      const std::shared_ptr<FlutterVideoPlayer>& player);
+  void ReportTextureDiagnostics(
+      const std::shared_ptr<FlutterVideoPlayer>& player);
   void ReapRetiredPlayers();
   std::shared_ptr<FlutterVideoPlayer> FindPlayer(int64_t texture_id);
   std::vector<int64_t> PlayerIds();
@@ -394,14 +438,31 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
               void* egl_context) -> const FlutterDesktopEGLImage* {
             instance->texture_frame_pending.store(
                 false, std::memory_order_release);
+            if (instance->texture_diagnostics_enabled) {
+              instance->texture_diagnostics.texture_callbacks.fetch_add(
+                  1, std::memory_order_relaxed);
+            }
             std::shared_ptr<GstVideoPlayer> player = instance->GetPlayer();
             if (!player) {
+              if (instance->texture_diagnostics_enabled) {
+                instance->texture_diagnostics.texture_no_player.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
               return nullptr;
             }
             instance->egl_image->width = player->GetWidth();
             instance->egl_image->height = player->GetHeight();
             instance->egl_image->egl_image =
                 player->GetEGLImage(egl_display, egl_context);
+            if (instance->texture_diagnostics_enabled) {
+              if (instance->egl_image->egl_image) {
+                instance->texture_diagnostics.texture_returned.fetch_add(
+                    1, std::memory_order_relaxed);
+              } else {
+                instance->texture_diagnostics.texture_no_frame.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
+            }
             return instance->egl_image.get();
           }));
 #else
@@ -412,6 +473,10 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
               size_t width, size_t height) -> const FlutterDesktopPixelBuffer* {
             instance->texture_frame_pending.store(
                 false, std::memory_order_release);
+            if (instance->texture_diagnostics_enabled) {
+              instance->texture_diagnostics.texture_callbacks.fetch_add(
+                  1, std::memory_order_relaxed);
+            }
             // Hold buffer_mutex across the whole copy AND the engine's later
             // glTexImage2D read: the engine reads the returned buffer after
             // this callback returns and signals completion via the buffer's
@@ -425,10 +490,18 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             // next decoded frame arrives. Blocking here delays every Flutter
             // overlay, including remote-driven media controls.
             if (!instance->buffer_mutex.try_lock()) {
+              if (instance->texture_diagnostics_enabled) {
+                instance->texture_diagnostics.texture_lock_busy.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
               return nullptr;
             }
             std::shared_ptr<GstVideoPlayer> player = instance->GetPlayer();
             if (!player) {
+              if (instance->texture_diagnostics_enabled) {
+                instance->texture_diagnostics.texture_no_player.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
               instance->buffer_mutex.unlock();
               return nullptr;
             }
@@ -436,8 +509,29 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             // callback. The engine may read the returned pixel pointer after
             // this callback returns.
             instance->in_flight_player = player;
+            std::chrono::steady_clock::time_point copy_started_at;
+            if (instance->texture_diagnostics_enabled) {
+              copy_started_at = std::chrono::steady_clock::now();
+            }
             const uint8_t* frame = player->GetFrameBuffer();
+            if (instance->texture_diagnostics_enabled) {
+              const uint64_t copy_time_ns = static_cast<uint64_t>(
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - copy_started_at)
+                      .count());
+              instance->texture_diagnostics.copy_time_ns.fetch_add(
+                  copy_time_ns, std::memory_order_relaxed);
+              instance->texture_diagnostics.copy_time_samples.fetch_add(
+                  1, std::memory_order_relaxed);
+              RecordDiagnosticMaximum(
+                  instance->texture_diagnostics.copy_time_max_ns,
+                  copy_time_ns);
+            }
             if (!frame) {
+              if (instance->texture_diagnostics_enabled) {
+                instance->texture_diagnostics.texture_no_frame.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
               instance->in_flight_player.reset();
               instance->buffer_mutex.unlock();
               return nullptr;
@@ -447,6 +541,22 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             instance->buffer->buffer = frame;
             instance->buffer->release_callback = [](void* ctx) {
               auto* player = static_cast<FlutterVideoPlayer*>(ctx);
+              if (player->texture_diagnostics_enabled) {
+                const uint64_t hold_time_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() -
+                        player->texture_buffer_returned_at)
+                        .count());
+                player->texture_diagnostics.buffer_releases.fetch_add(
+                    1, std::memory_order_relaxed);
+                player->texture_diagnostics.buffer_hold_time_ns.fetch_add(
+                    hold_time_ns, std::memory_order_relaxed);
+                player->texture_diagnostics.buffer_hold_time_samples.fetch_add(
+                    1, std::memory_order_relaxed);
+                RecordDiagnosticMaximum(
+                    player->texture_diagnostics.buffer_hold_time_max_ns,
+                    hold_time_ns);
+              }
               // Drop the final native-player reference only after releasing
               // buffer_mutex. GstVideoPlayer destruction can stop GStreamer
               // callbacks and must never run while the texture lock is held.
@@ -455,6 +565,12 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
               player->buffer_mutex.unlock();
             };
             instance->buffer->release_context = instance;
+            if (instance->texture_diagnostics_enabled) {
+              instance->texture_buffer_returned_at =
+                  std::chrono::steady_clock::now();
+              instance->texture_diagnostics.texture_returned.fetch_add(
+                  1, std::memory_order_relaxed);
+            }
             return instance->buffer.get();
           }));
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -516,15 +632,30 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
         },
         // OnNotifyFrameDecoded
         [texture_id, instance = instance.get(), host = this]() {
+          if (instance->texture_diagnostics_enabled) {
+            instance->texture_diagnostics.decoded_frames.fetch_add(
+                1, std::memory_order_relaxed);
+          }
           bool expected = false;
           if (!instance->texture_frame_pending.compare_exchange_strong(
                   expected, true, std::memory_order_acq_rel)) {
+            if (instance->texture_diagnostics_enabled) {
+              instance->texture_diagnostics.texture_coalesced.fetch_add(
+                  1, std::memory_order_relaxed);
+            }
             return;
           }
           if (!host->texture_registrar_->MarkTextureFrameAvailable(
                   texture_id)) {
+            if (instance->texture_diagnostics_enabled) {
+              instance->texture_diagnostics.texture_mark_failed.fetch_add(
+                  1, std::memory_order_relaxed);
+            }
             instance->texture_frame_pending.store(
                 false, std::memory_order_release);
+          } else if (instance->texture_diagnostics_enabled) {
+            instance->texture_diagnostics.texture_marked.fetch_add(
+                1, std::memory_order_relaxed);
           }
         },
         // OnNotifyCompleted
@@ -634,6 +765,7 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
   }
   auto player = player_entry->GetPlayer();
   if (!player) return;
+  StartTextureDiagnostics(player_entry);
   player->LogPlaybackStartup("plugin_create_reply_ready");
   result.SetTextureId(texture_id);
   value.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
@@ -948,6 +1080,118 @@ VideoPlayerPlugin::FindPlayer(int64_t texture_id) {
   return it == players_.end() ? nullptr : it->second;
 }
 
+void VideoPlayerPlugin::StartTextureDiagnostics(
+    const std::shared_ptr<FlutterVideoPlayer>& player) {
+#ifdef SOATV_TEXTURE_DIAG_DEFAULT
+  const bool enabled_by_build = true;
+#else
+  const bool enabled_by_build = false;
+#endif
+  const char* enabled = std::getenv("SOATV_TEXTURE_DIAG");
+  const bool enabled_at_runtime =
+      enabled && ((enabled[0] == '1' && enabled[1] == '\0') ||
+                  (enabled[0] == 't' && enabled[1] == 'r' &&
+                   enabled[2] == 'u' && enabled[3] == 'e' &&
+                   enabled[4] == '\0'));
+  if (!enabled_by_build && !enabled_at_runtime) {
+    return;
+  }
+
+  player->texture_diagnostics_enabled = true;
+  std::cout << "TEXTURE_DIAG enabled texture=" << player->texture_id
+            << " interval_ms=1000 path="
+#ifdef USE_EGL_IMAGE_DMABUF
+            << "egl"
+#else
+            << "pixel_buffer"
+#endif
+            << std::endl;
+  player->texture_diagnostics_thread = std::thread(
+      [this, player]() { ReportTextureDiagnostics(player); });
+}
+
+void VideoPlayerPlugin::StopTextureDiagnostics(
+    const std::shared_ptr<FlutterVideoPlayer>& player) {
+  if (!player->texture_diagnostics_thread.joinable()) return;
+  player->texture_diagnostics_stopping.store(true, std::memory_order_release);
+  player->texture_diagnostics_wait_cv.notify_all();
+  if (player->texture_diagnostics_thread.get_id() !=
+      std::this_thread::get_id()) {
+    player->texture_diagnostics_thread.join();
+  }
+}
+
+void VideoPlayerPlugin::ReportTextureDiagnostics(
+    const std::shared_ptr<FlutterVideoPlayer>& player) {
+  auto& stats = player->texture_diagnostics;
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(player->texture_diagnostics_wait_mutex);
+      player->texture_diagnostics_wait_cv.wait_for(
+          lock, std::chrono::seconds(1), [player]() {
+            return player->texture_diagnostics_stopping.load(
+                std::memory_order_acquire);
+          });
+    }
+    if (player->texture_diagnostics_stopping.load(std::memory_order_acquire)) {
+      return;
+    }
+
+    const uint64_t decoded =
+        stats.decoded_frames.exchange(0, std::memory_order_relaxed);
+    const uint64_t marked =
+        stats.texture_marked.exchange(0, std::memory_order_relaxed);
+    const uint64_t coalesced =
+        stats.texture_coalesced.exchange(0, std::memory_order_relaxed);
+    const uint64_t mark_failed =
+        stats.texture_mark_failed.exchange(0, std::memory_order_relaxed);
+    const uint64_t callbacks =
+        stats.texture_callbacks.exchange(0, std::memory_order_relaxed);
+    const uint64_t returned =
+        stats.texture_returned.exchange(0, std::memory_order_relaxed);
+    const uint64_t lock_busy =
+        stats.texture_lock_busy.exchange(0, std::memory_order_relaxed);
+    const uint64_t no_player =
+        stats.texture_no_player.exchange(0, std::memory_order_relaxed);
+    const uint64_t no_frame =
+        stats.texture_no_frame.exchange(0, std::memory_order_relaxed);
+    const uint64_t releases =
+        stats.buffer_releases.exchange(0, std::memory_order_relaxed);
+    const uint64_t copy_time_ns =
+        stats.copy_time_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t copy_samples =
+        stats.copy_time_samples.exchange(0, std::memory_order_relaxed);
+    const uint64_t copy_max_ns =
+        stats.copy_time_max_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t hold_time_ns =
+        stats.buffer_hold_time_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t hold_samples =
+        stats.buffer_hold_time_samples.exchange(0, std::memory_order_relaxed);
+    const uint64_t hold_max_ns =
+        stats.buffer_hold_time_max_ns.exchange(0, std::memory_order_relaxed);
+
+    std::ostringstream line;
+    line << "TEXTURE_DIAG texture=" << player->texture_id
+         << " interval_ms=1000 decoded_fps=" << decoded << " marked=" << marked
+         << " coalesced=" << coalesced << " mark_failed=" << mark_failed
+         << " callbacks=" << callbacks << " returned=" << returned
+         << " lock_busy=" << lock_busy << " no_player=" << no_player
+         << " no_frame=" << no_frame << " releases=" << releases;
+    if (copy_samples > 0) {
+      line << " copy_avg_ms="
+           << (static_cast<double>(copy_time_ns) / copy_samples / 1000000.0)
+           << " copy_max_ms=" << (static_cast<double>(copy_max_ns) / 1000000.0);
+    }
+    if (hold_samples > 0) {
+      line << " buffer_hold_avg_ms="
+           << (static_cast<double>(hold_time_ns) / hold_samples / 1000000.0)
+           << " buffer_hold_max_ms="
+           << (static_cast<double>(hold_max_ns) / 1000000.0);
+    }
+    std::cout << line.str() << std::endl;
+  }
+}
+
 std::vector<int64_t> VideoPlayerPlugin::PlayerIds() {
   std::lock_guard<std::mutex> guard(players_mutex_);
   std::vector<int64_t> texture_ids;
@@ -973,6 +1217,7 @@ void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
       player->initialization_thread.get_id() != std::this_thread::get_id()) {
     player->initialization_thread.join();
   }
+  StopTextureDiagnostics(player);
 
   // Detach the Dart-facing channels (platform thread — safe).
   {
