@@ -2788,6 +2788,15 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
                              "hlsdemux2") == 0) {
       self->ConfigureAdaptiveDemux2(element);
     } else {
+      // Legacy playbin's decodebin autoplugs hlsdemux2 first (rank primary+1),
+      // discards it, then falls back to hlsdemux (device log 2026-11-02:
+      // hlsdemux2-0 then hlsdemux0 within 5 ms). hls_demux_ now points at the
+      // legacy demuxer, so drop the hlsdemux2 mode or ABR would poll a
+      // property it lacks and ignore the http-source samples it still needs.
+      if (self->adaptive_demux2_.exchange(false)) {
+        std::cout << "ABR: hlsdemux2 was replaced by " << name
+                  << " — using legacy demuxer handling" << std::endl;
+      }
       GObjectClass* klass = G_OBJECT_GET_CLASS(element);
       if (g_object_class_find_property(klass, "bitrate-limit")) {
         g_object_set(element, "bitrate-limit", 1.0f, NULL);
