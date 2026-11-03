@@ -168,6 +168,9 @@ class VideoPlayerPlugin : public flutter::Plugin {
     std::condition_variable texture_diagnostics_wait_cv;
     std::thread texture_diagnostics_thread;
     std::chrono::steady_clock::time_point texture_buffer_returned_at;
+    // Raster thread only: FLASH line rate limiter for the copy callback.
+    int64_t flash_window_sec = -1;
+    int flash_lines_in_window = 0;
 #ifdef USE_EGL_IMAGE_DMABUF
     std::unique_ptr<FlutterDesktopEGLImage> egl_image;
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -237,6 +240,20 @@ class VideoPlayerPlugin : public flutter::Plugin {
       const std::shared_ptr<FlutterVideoPlayer>& player);
   void StopTextureDiagnostics(
       const std::shared_ptr<FlutterVideoPlayer>& player);
+  // Raster thread only. FLASH line for a refresh where the copy callback
+  // returned no frame before reaching the native player; at most 5 per second.
+  static void LogTextureFlash(FlutterVideoPlayer* player, const char* reason) {
+    const int64_t now_sec =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    if (now_sec != player->flash_window_sec) {
+      player->flash_window_sec = now_sec;
+      player->flash_lines_in_window = 0;
+    }
+    if (++player->flash_lines_in_window > 5) return;
+    std::cout << "FLASH: kind=no_frame " << reason << std::endl;
+  }
   void ReportTextureDiagnostics(
       const std::shared_ptr<FlutterVideoPlayer>& player);
   void ReapRetiredPlayers();
@@ -537,6 +554,8 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
               if (instance->texture_diagnostics_enabled) {
                 instance->texture_diagnostics.texture_lock_busy.fetch_add(
                     1, std::memory_order_relaxed);
+                LogTextureFlash(instance,
+                                "reason=engine_still_holds_previous_frame");
               }
               return nullptr;
             }
@@ -545,6 +564,7 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
               if (instance->texture_diagnostics_enabled) {
                 instance->texture_diagnostics.texture_no_player.fetch_add(
                     1, std::memory_order_relaxed);
+                LogTextureFlash(instance, "reason=no_native_player");
               }
               instance->buffer_mutex.unlock();
               return nullptr;
@@ -1151,6 +1171,9 @@ void VideoPlayerPlugin::StartTextureDiagnostics(
   }
 
   player->texture_diagnostics_enabled = true;
+  if (std::shared_ptr<GstVideoPlayer> native = player->GetPlayer()) {
+    native->SetFrameDiagnostics(true);
+  }
   std::cout << "TEXTURE_DIAG enabled texture=" << player->texture_id
             << " interval_ms=1000 path="
 #ifdef USE_EGL_IMAGE_DMABUF
@@ -1177,6 +1200,7 @@ void VideoPlayerPlugin::StopTextureDiagnostics(
 void VideoPlayerPlugin::ReportTextureDiagnostics(
     const std::shared_ptr<FlutterVideoPlayer>& player) {
   auto& stats = player->texture_diagnostics;
+  int soc_tick = 0;
   while (true) {
     {
       std::unique_lock<std::mutex> lock(player->texture_diagnostics_wait_mutex);
@@ -1211,8 +1235,12 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
     // Subset of no_frame: the frame existed but a handoff held the player's
     // buffer lock. The rest of no_frame means no decoded frame yet.
     uint64_t frame_lock_busy = 0;
+    uint64_t black_frames = 0;
+    uint64_t transparent_frames = 0;
     if (std::shared_ptr<GstVideoPlayer> native = player->GetPlayer()) {
       frame_lock_busy = native->TakeFrameLockBusyCount();
+      black_frames = native->TakeBlackFrameCount();
+      transparent_frames = native->TakeTransparentFrameCount();
     }
     const uint64_t releases =
         stats.buffer_releases.exchange(0, std::memory_order_relaxed);
@@ -1242,7 +1270,10 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
          << " callbacks=" << callbacks << " returned=" << returned
          << " lock_busy=" << lock_busy << " no_player=" << no_player
          << " no_frame=" << no_frame
-         << " frame_lock_busy=" << frame_lock_busy << " releases=" << releases;
+         << " frame_lock_busy=" << frame_lock_busy
+         << " black_frames=" << black_frames
+         << " transparent_frames=" << transparent_frames
+         << " releases=" << releases;
     if (copy_samples > 0) {
       line << " copy_avg_ms="
            << (static_cast<double>(copy_time_ns) / copy_samples / 1000000.0)
@@ -1262,6 +1293,8 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
            << (static_cast<double>(hold_max_ns) / 1000000.0);
     }
     std::cout << line.str() << std::endl;
+    // Thermal throttling comes and goes, so sample it alongside the counters.
+    if (++soc_tick % 10 == 0) GstVideoPlayer::LogSocState();
   }
 }
 

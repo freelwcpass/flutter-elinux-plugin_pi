@@ -52,6 +52,26 @@ static bool FindAnyHdmiAlsaCard(int* out_card, std::string* out_id) {
   return false;
 }
 
+// hdmi_force_hotplug=1 / video=HDMI-A-1:...D make the connector report
+// "connected" even with no display attached. The vc4 HDMI audio driver then
+// has no EDID, decides the sink can't play audio and fails the PCM open with
+// ENOTSUPP (524). Only a non-empty EDID proves a real display is attached.
+static bool HdmiHasEdid(int hdmi_idx) {
+  char pattern[64];
+  std::snprintf(pattern, sizeof(pattern), "/sys/class/drm/card*-HDMI-A-%d/edid",
+                hdmi_idx);
+  glob_t g{};
+  bool has_edid = false;
+  if (glob(pattern, 0, nullptr, &g) == 0) {
+    for (size_t i = 0; i < g.gl_pathc && !has_edid; ++i) {
+      std::ifstream f(g.gl_pathv[i], std::ios::binary);
+      has_edid = f && f.get() != std::char_traits<char>::eof();
+    }
+  }
+  globfree(&g);
+  return has_edid;
+}
+
 static std::string PickAudioDevice() {
   const char* override_device = std::getenv("AUDIOPLAYERS_ELINUX_ALSA_DEVICE");
   if (override_device && override_device[0] != '\0') {
@@ -60,6 +80,7 @@ static std::string PickAudioDevice() {
     return override_device;
   }
 
+  bool forced_without_display = false;
   for (int hdmi_idx = 1; hdmi_idx <= 4; ++hdmi_idx) {
     char pattern[64];
     std::snprintf(pattern, sizeof(pattern),
@@ -82,6 +103,14 @@ static std::string PickAudioDevice() {
     if (!connected) {
       continue;
     }
+    if (!HdmiHasEdid(hdmi_idx)) {
+      std::cout << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
+                << " reports connected but has no EDID (forced hotplug, no "
+                   "display) — skipping HDMI audio"
+                << std::endl;
+      forced_without_display = true;
+      continue;
+    }
 
     char target[16];
     std::snprintf(target, sizeof(target), "vc4hdmi%d", hdmi_idx - 1);
@@ -101,7 +130,9 @@ static std::string PickAudioDevice() {
 
   int hdmi_card = -1;
   std::string hdmi_id;
-  if (FindAnyHdmiAlsaCard(&hdmi_card, &hdmi_id)) {
+  // Guessing an HDMI card only helps when DRM can't tell us anything. When it
+  // said "connected" without a display, HDMI audio would fail with ENOTSUPP.
+  if (!forced_without_display && FindAnyHdmiAlsaCard(&hdmi_card, &hdmi_id)) {
     std::string device = DeviceForAlsaCard(hdmi_card);
     std::cout << "PickAudioDevice (audio): DRM did not report connected HDMI, "
               << "using ALSA HDMI card " << hdmi_card << " (" << hdmi_id

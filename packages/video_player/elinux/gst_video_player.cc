@@ -347,6 +347,30 @@ constexpr char kStreamUnavailablePrefix[] = "STREAM_UNAVAILABLE: ";
 // because retrying against the same slow link will keep failing the same way.
 constexpr char kNetworkTooSlowPrefix[] = "NETWORK_TOO_SLOW: ";
 
+// ENOTSUPP (524, "Unknown error 524" in alsa-lib's message): the vc4 HDMI
+// audio driver refuses to open because it believes the sink has no audio.
+bool IsAlsaDeviceUnsupported(const GError* error, const gchar* debug) {
+  std::string text;
+  if (error && error->message) text += error->message;
+  if (debug) {
+    if (!text.empty()) text += " ";
+    text += debug;
+  }
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return text.find("alsa") != std::string::npos &&
+         (text.find("error 524") != std::string::npos ||
+          text.find("not supported") != std::string::npos);
+}
+
+// playbin3's playsink posts this right after a failed ALSA open.
+bool IsAudioSinkNotWorking(const GError* error) {
+  if (!error || !error->message) return false;
+  const std::string text = error->message;
+  return text.find("audiosink") != std::string::npos &&
+         text.find("not working") != std::string::npos;
+}
+
 bool IsAlsaDeviceBusy(const GError* error, const gchar* debug) {
   std::string text;
   if (error && error->message) text += error->message;
@@ -582,10 +606,13 @@ void WriteCodecCapabilities() {
           GST_ELEMENT_FACTORY_TYPE_DECODER |
           GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO),
       "video/x-h264");
-  // .m4s: fragmented-MP4 (CMAF) segments typefind as video/quicktime, so a
-  // demuxer accepting that (qtdemux) is what unpacks them.
-  const FactoryMatch m4s = FindFactoriesAccepting(
-      GST_ELEMENT_FACTORY_TYPE_DEMUXER, "video/quicktime");
+  // AV1: same check. The Pi 4 has no AV1 hardware decoder, so expect either
+  // nothing or software decoders only (dav1ddec, av1dec, avdec_av1).
+  const FactoryMatch av1 = FindFactoriesAccepting(
+      static_cast<GstElementFactoryListType>(
+          GST_ELEMENT_FACTORY_TYPE_DECODER |
+          GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO),
+      "video/x-av1");
   std::vector<std::string> hls_demuxers;
   for (const char* name : {"hlsdemux2", "hlsdemux"}) {
     if (HasFactory(name)) hls_demuxers.emplace_back(name);
@@ -608,16 +635,19 @@ void WriteCodecCapabilities() {
   json += ", \"hardware\": ";
   json += h264.hardware ? "true" : "false";
   json += ", \"decoders\": " + JsonStringArray(h264.names) + "},\n";
-  json += "  \"m4s\": {\"supported\": ";
-  json += m4s.names.empty() ? "false" : "true";
-  json += ", \"demuxers\": " + JsonStringArray(m4s.names) + "},\n";
+  json += "  \"av1\": {\"supported\": ";
+  json += av1.names.empty() ? "false" : "true";
+  json += ", \"hardware\": ";
+  json += av1.hardware ? "true" : "false";
+  json += ", \"decoders\": " + JsonStringArray(av1.names) + "},\n";
   json += "  \"hls_demuxers\": " + JsonStringArray(hls_demuxers) + "\n";
   json += "}\n";
   g_free(gst_version);
 
   std::cout << "CODEC-CAPS: h264=" << (h264.names.empty() ? "no" : "yes")
             << (h264.hardware ? " (hardware)" : "")
-            << " m4s=" << (m4s.names.empty() ? "no" : "yes")
+            << " av1=" << (av1.names.empty() ? "no" : "yes")
+            << (av1.hardware ? " (hardware)" : "")
             << " hls_demuxers=" << hls_demuxers.size() << std::endl;
 
   // Write to a temp file, fsync, then rename, so a power cut mid-write never
@@ -1387,22 +1417,146 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
   std::shared_lock<std::shared_mutex> lock(mutex_buffer_, std::try_to_lock);
   if (!lock.owns_lock()) {
     frame_lock_busy_.fetch_add(1, std::memory_order_relaxed);
+    if (frame_diag_enabled_.load(std::memory_order_relaxed)) {
+      LogFlash("kind=no_frame reason=frame_swap_in_progress");
+    }
     return nullptr;
   }
   if (!gst_.buffer) {
+    if (frame_diag_enabled_.load(std::memory_order_relaxed)) {
+      LogFlash("kind=no_frame reason=no_decoded_frame");
+    }
     return nullptr;
   }
 
   const uint32_t pixel_bytes = width_ * height_ * 4;
   gst_buffer_extract(gst_.buffer, 0, pixels_.get(), pixel_bytes);
+  if (frame_diag_enabled_.load(std::memory_order_relaxed)) {
+    ClassifyFrameForDiagnostics();
+  }
   return reinterpret_cast<const uint8_t*>(pixels_.get());
 #endif
+}
+
+// Raster thread, after the frame was copied into pixels_ (RGBA in memory).
+// 64 samples on an 8x8 grid: cheap next to the ~17 ms copy. A real fade to
+// black in the content also counts, so the FLASH start/end lines (a run of
+// one or two refreshes between normal frames) matter more than the counts.
+void GstVideoPlayer::ClassifyFrameForDiagnostics() {
+  if (width_ <= 0 || height_ <= 0 || !pixels_) return;
+  const auto* px = reinterpret_cast<const uint8_t*>(pixels_.get());
+  bool all_dark = true;
+  bool all_clear = true;
+  for (int gy = 0; gy < 8; ++gy) {
+    for (int gx = 0; gx < 8; ++gx) {
+      const size_t x = static_cast<size_t>((2 * gx + 1) * width_ / 16);
+      const size_t y = static_cast<size_t>((2 * gy + 1) * height_ / 16);
+      const uint8_t* p = px + (y * static_cast<size_t>(width_) + x) * 4;
+      if (p[0] >= 16 || p[1] >= 16 || p[2] >= 16) all_dark = false;
+      if (p[3] != 0) all_clear = false;
+    }
+  }
+  const int kind = all_clear ? 2 : (all_dark ? 1 : 0);
+  if (kind == 1) black_frames_.fetch_add(1, std::memory_order_relaxed);
+  if (kind == 2) transparent_frames_.fetch_add(1, std::memory_order_relaxed);
+
+  static const char* const kKindNames[] = {"normal", "black", "transparent"};
+  if (kind != bad_frame_kind_) {
+    if (bad_frame_kind_ != 0) {
+      LogFlash(std::string("kind=") + kKindNames[bad_frame_kind_] +
+               " ended after " + std::to_string(bad_frame_run_) +
+               " refreshes");
+    }
+    if (kind != 0) {
+      LogFlash(std::string("kind=") + kKindNames[kind] +
+               " started frame=" +
+               std::to_string(
+                   frames_handed_off_.load(std::memory_order_relaxed)));
+    }
+    bad_frame_kind_ = kind;
+    bad_frame_run_ = 0;
+  }
+  if (kind != 0) ++bad_frame_run_;
+}
+
+// Raster thread only. At most 5 FLASH lines per second so a burst can't
+// flood the log; the next printed line reports how many were dropped.
+void GstVideoPlayer::LogFlash(const std::string& detail) {
+  const int64_t now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now()
+                                  .time_since_epoch())
+                              .count();
+  if (now_sec != flash_window_sec_) {
+    flash_window_sec_ = now_sec;
+    flash_lines_in_window_ = 0;
+  }
+  if (++flash_lines_in_window_ > 5) {
+    ++flash_suppressed_;
+    return;
+  }
+  std::cout << "FLASH: " << detail;
+  if (flash_suppressed_ > 0) {
+    std::cout << " (suppressed " << flash_suppressed_ << " earlier)";
+    flash_suppressed_ = 0;
+  }
+  std::cout << std::endl;
+}
+
+// static
+void GstVideoPlayer::LogSocState() {
+  std::string temp = "unavailable";
+  std::ifstream tf("/sys/class/thermal/thermal_zone0/temp");
+  int millideg = 0;
+  if (tf >> millideg) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%.1fC", millideg / 1000.0);
+    temp = buf;
+  }
+  std::string mhz = "unavailable";
+  std::ifstream ff("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq");
+  long khz = 0;
+  if (ff >> khz) mhz = std::to_string(khz / 1000);
+  // throttled=0x0 means no undervoltage, frequency cap or thermal throttle
+  // now or since boot. vcgencmd may be missing on minimal images.
+  std::string throttled = "unavailable";
+  if (FILE* fp = popen("vcgencmd get_throttled 2>/dev/null", "r")) {
+    char line[64];
+    if (fgets(line, sizeof(line), fp)) {
+      std::string s(line);
+      if (!s.empty() && s.back() == '\n') s.pop_back();
+      const auto eq = s.find('=');
+      throttled = eq == std::string::npos ? s : s.substr(eq + 1);
+    }
+    pclose(fp);
+  }
+  std::cout << "SOC: temp=" << temp << " cpu_mhz=" << mhz
+            << " throttled=" << throttled << std::endl;
 }
 
 // Pick an ALSA device for audio output by detecting which HDMI connector is
 // physically connected via DRM, then mapping back to the matching ALSA card.
 // DRM connector "HDMI-A-N" pairs with ALSA card id "vc4hdmi{N-1}".
 // Falls back to plughw:0,0 (3.5mm jack on Pi) if no HDMI is connected.
+// hdmi_force_hotplug=1 / video=HDMI-A-1:...D make the connector report
+// "connected" even with no display attached. The vc4 HDMI audio driver then
+// has no EDID, decides the sink can't play audio and fails the PCM open with
+// ENOTSUPP (524). Only a non-empty EDID proves a real display is attached.
+static bool HdmiHasEdid(int hdmi_idx) {
+  char pattern[64];
+  std::snprintf(pattern, sizeof(pattern), "/sys/class/drm/card*-HDMI-A-%d/edid",
+                hdmi_idx);
+  glob_t g{};
+  bool has_edid = false;
+  if (glob(pattern, 0, nullptr, &g) == 0) {
+    for (size_t i = 0; i < g.gl_pathc && !has_edid; ++i) {
+      std::ifstream f(g.gl_pathv[i], std::ios::binary);
+      has_edid = f && f.get() != std::char_traits<char>::eof();
+    }
+  }
+  globfree(&g);
+  return has_edid;
+}
+
 static std::string PickAudioDevice() {
   for (int hdmi_idx = 1; hdmi_idx <= 4; ++hdmi_idx) {
     char pattern[64];
@@ -1424,6 +1578,13 @@ static std::string PickAudioDevice() {
     }
     globfree(&g);
     if (!connected) continue;
+    if (!HdmiHasEdid(hdmi_idx)) {
+      std::cout << "PickAudioDevice: HDMI-A-" << hdmi_idx
+                << " reports connected but has no EDID (forced hotplug, no "
+                   "display) — skipping HDMI audio"
+                << std::endl;
+      continue;
+    }
 
     char target[16];
     std::snprintf(target, sizeof(target), "vc4hdmi%d", hdmi_idx - 1);
@@ -1949,8 +2110,14 @@ bool GstVideoPlayer::Preroll() {
   constexpr int kAlsaBusyRetries =
       sizeof(kAlsaBusyRetryDelaysMs) / sizeof(kAlsaBusyRetryDelaysMs[0]);
   int busy_retries = 0;
+  struct PrerollFlag {
+    std::atomic<bool>& flag;
+    explicit PrerollFlag(std::atomic<bool>& f) : flag(f) { flag.store(true); }
+    ~PrerollFlag() { flag.store(false); }
+  } preroll_flag(in_preroll_);
   while (true) {
     audio_device_busy_.store(false);
+    audio_device_unsupported_.store(false);
     auto result = gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
     if (result != GST_STATE_CHANGE_FAILURE && !audio_device_busy_.load()) {
       // NO_PREROLL (live source) and ASYNC are both acceptable — not errors.
@@ -1982,7 +2149,9 @@ bool GstVideoPlayer::Preroll() {
       return false;
     }
     if (audio_device_busy_.load()) {
-      if (!audio_disabled_ && busy_retries < kAlsaBusyRetries) {
+      const bool unsupported = audio_device_unsupported_.load();
+      if (!audio_disabled_ && !unsupported &&
+          busy_retries < kAlsaBusyRetries) {
         const int delay_ms = kAlsaBusyRetryDelaysMs[busy_retries++];
         std::cerr << "Preroll: ALSA device busy; retry " << busy_retries << "/"
                   << kAlsaBusyRetries << " in " << delay_ms << "ms"
@@ -1994,8 +2163,15 @@ bool GstVideoPlayer::Preroll() {
         continue;
       }
       if (!audio_disabled_ && DisableAudioSink()) {
-        std::cerr << "Preroll: ALSA device still busy after " << busy_retries
-                  << " retries; continuing video without audio" << std::endl;
+        if (unsupported) {
+          std::cerr << "Preroll: HDMI audio not supported by the attached "
+                       "display (ENOTSUPP); continuing video without audio"
+                    << std::endl;
+        } else {
+          std::cerr << "Preroll: ALSA device still busy after "
+                    << busy_retries
+                    << " retries; continuing video without audio" << std::endl;
+        }
         continue;
       }
       return false;
@@ -3075,11 +3251,11 @@ void GstVideoPlayer::ConfigureAdaptiveDemux2(GstElement* demux) {
   // "percent of kBufferTargetSecs", which AbrTick's buffer zones assume.
   SetNumericProperty(demux, "max-buffering-time",
                      static_cast<double>(kBufferTargetNs));
-  SetNumericProperty(demux, "buffering-high-watermark-time",
+  SetNumericProperty(demux, "high-watermark-time",
                      static_cast<double>(kBufferTargetNs));
   for (const char* prop :
-       {"max-buffering-time", "buffering-high-watermark-time",
-        "buffering-low-watermark-time"}) {
+       {"max-buffering-time", "high-watermark-time",
+        "low-watermark-time"}) {
     double value = 0.0;
     if (GetNumericProperty(demux, prop, &value)) {
       std::cout << "BUFFERING: hlsdemux2 " << prop << "="
@@ -3776,7 +3952,22 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       // this to Dart immediately would trigger a reconnect before the native
       // silent-audio fallback can retry the same pipeline.
       if (IsAlsaDeviceBusy(error, debug)) {
+        if (IsAlsaDeviceUnsupported(error, debug)) {
+          self->audio_device_unsupported_.store(true);
+        }
         self->audio_device_busy_.store(true);
+        g_free(debug);
+        g_error_free(error);
+        break;
+      }
+      // Same failure, reported again by playsink under playbin3 ("Configured
+      // audiosink audio_bin is not working"). Forwarding it made Dart
+      // reconnect instead of letting Preroll() retry or fall back to silence.
+      if (self->in_preroll_.load() && self->audio_device_busy_.load() &&
+          IsAudioSinkNotWorking(error)) {
+        std::cerr << "Preroll: playsink follow-up to the ALSA open failure "
+                     "handled natively"
+                  << std::endl;
         g_free(debug);
         g_error_free(error);
         break;

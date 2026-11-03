@@ -75,6 +75,21 @@ class GstVideoPlayer {
   uint64_t TakeFrameLockBusyCount() {
     return frame_lock_busy_.exchange(0, std::memory_order_relaxed);
   }
+  // TEXTURE_DIAG frame analysis. When enabled, GetFrameBuffer() samples each
+  // frame it hands to Flutter and counts frames that are black (RGB all dark)
+  // or transparent (alpha 0, drawn as whatever is behind the texture), and
+  // logs rate-limited FLASH lines for those and for refreshes with no frame.
+  void SetFrameDiagnostics(bool enabled) {
+    frame_diag_enabled_.store(enabled, std::memory_order_relaxed);
+  }
+  uint64_t TakeBlackFrameCount() {
+    return black_frames_.exchange(0, std::memory_order_relaxed);
+  }
+  uint64_t TakeTransparentFrameCount() {
+    return transparent_frames_.exchange(0, std::memory_order_relaxed);
+  }
+  // One SOC: line with temperature, CPU clock and firmware throttle flags.
+  static void LogSocState();
 #ifdef USE_EGL_IMAGE_DMABUF
   void* GetEGLImage(void* egl_display, void* egl_context);
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -161,6 +176,8 @@ class GstVideoPlayer {
                                                     gpointer user_data);
   void PollAdaptiveDemuxBandwidth();
   bool IsVideoCodecAllowed(const GstCaps* caps) const;
+  void ClassifyFrameForDiagnostics();
+  void LogFlash(const std::string& detail);
 #ifdef USE_EGL_IMAGE_DMABUF
   void UnrefEGLImage();
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -177,6 +194,13 @@ class GstVideoPlayer {
   // with a silent sink instead of failing the whole pipeline.
   bool audio_disabled_ = false;
   std::atomic<bool> audio_device_busy_{false};
+  // The ALSA open failed with ENOTSUPP (524): HDMI audio isn't available for
+  // the attached sink (no EDID / DVI). Retrying can't help, so Preroll() goes
+  // straight to the silent fallback.
+  std::atomic<bool> audio_device_unsupported_{false};
+  // True while Preroll() runs; only then is playsink's follow-up error to a
+  // failed ALSA open handled natively instead of being reported to Dart.
+  std::atomic<bool> in_preroll_{false};
   std::string uri_;
   std::vector<std::string> supported_video_codecs_;
   // Private metadata parsed from the `#soatv:` URI fragment. startup_kbps
@@ -262,6 +286,16 @@ class GstVideoPlayer {
       std::chrono::steady_clock::now();
   std::atomic<uint64_t> frames_handed_off_{0};  // bumped per video buffer
   std::atomic<uint64_t> frame_lock_busy_{0};  // see TakeFrameLockBusyCount()
+  std::atomic<bool> frame_diag_enabled_{false};
+  std::atomic<uint64_t> black_frames_{0};
+  std::atomic<uint64_t> transparent_frames_{0};
+  // Raster thread only (GetFrameBuffer). Current run of bad frames (0 = none,
+  // 1 = black, 2 = transparent) and the FLASH line rate limiter.
+  int bad_frame_kind_ = 0;
+  uint64_t bad_frame_run_ = 0;
+  int64_t flash_window_sec_ = -1;
+  int flash_lines_in_window_ = 0;
+  uint64_t flash_suppressed_ = 0;
   // Previous tick's buffer_health_secs, used by LogPlaybackHealth to detect a
   // sharp collapse (e.g. buffer dropping from 30s to 2s in one tick, which we
   // have seen but never captured the cause of). Only touched from the watchdog
