@@ -1237,10 +1237,12 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
     uint64_t frame_lock_busy = 0;
     uint64_t black_frames = 0;
     uint64_t transparent_frames = 0;
+    GstVideoPlayer::HandoffLockStats handoff;
     if (std::shared_ptr<GstVideoPlayer> native = player->GetPlayer()) {
       frame_lock_busy = native->TakeFrameLockBusyCount();
       black_frames = native->TakeBlackFrameCount();
       transparent_frames = native->TakeTransparentFrameCount();
+      handoff = native->TakeHandoffLockStats();
     }
     const uint64_t releases =
         stats.buffer_releases.exchange(0, std::memory_order_relaxed);
@@ -1291,6 +1293,18 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
            << (static_cast<double>(hold_time_ns) / hold_samples / 1000000.0)
            << " buffer_hold_max_ms="
            << (static_cast<double>(hold_max_ns) / 1000000.0);
+    }
+    // Decode-thread side of mutex_buffer_: wait = blocked behind a frame copy,
+    // hold = exclusive section (frame_lock_busy window), unref = previous
+    // frame's gst_buffer_unref inside that section.
+    if (handoff.samples > 0) {
+      const double n = static_cast<double>(handoff.samples);
+      line << " handoff_wait_avg_ms=" << (handoff.wait_ns / n / 1000000.0)
+           << " handoff_wait_max_ms=" << (handoff.wait_max_ns / 1000000.0)
+           << " handoff_hold_avg_ms=" << (handoff.hold_ns / n / 1000000.0)
+           << " handoff_hold_max_ms=" << (handoff.hold_max_ns / 1000000.0)
+           << " handoff_unref_avg_ms=" << (handoff.unref_ns / n / 1000000.0)
+           << " handoff_unref_max_ms=" << (handoff.unref_max_ns / 1000000.0);
     }
     std::cout << line.str() << std::endl;
     // Thermal throttling comes and goes, so sample it alongside the counters.

@@ -2363,16 +2363,48 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   gst_structure_get_int(structure, "height", &height);
   gst_caps_unref(caps);
 
+  // TEXTURE_DIAG only: time the exclusive section below. Measurement only —
+  // the locking and the order of operations are unchanged.
+  const bool timed = self->frame_diag_enabled_.load(std::memory_order_relaxed);
+  std::chrono::steady_clock::time_point wait_started, locked_at, unref_started,
+      unref_done, unlocking_at;
+  if (timed) wait_started = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::shared_mutex> lock(self->mutex_buffer_);
+    if (timed) locked_at = std::chrono::steady_clock::now();
     if (width != self->width_ || height != self->height_) {
       self->width_ = width;
       self->height_ = height;
       if (width > 0 && height > 0)
         self->pixels_.reset(new uint32_t[width * height]);
     }
+    if (timed) unref_started = std::chrono::steady_clock::now();
     if (self->gst_.buffer) gst_buffer_unref(self->gst_.buffer);
+    if (timed) unref_done = std::chrono::steady_clock::now();
     self->gst_.buffer = gst_buffer_ref(buf);
+    if (timed) unlocking_at = std::chrono::steady_clock::now();
+  }
+  if (timed) {
+    auto ns = [](std::chrono::steady_clock::duration d) {
+      return static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+    };
+    // Single writer (the streaming thread); the TEXTURE_DIAG thread only
+    // exchanges these to 0, so a racing reset can at worst drop one sample.
+    auto record_max = [](std::atomic<uint64_t>& maximum, uint64_t value) {
+      if (value > maximum.load(std::memory_order_relaxed))
+        maximum.store(value, std::memory_order_relaxed);
+    };
+    const uint64_t wait_ns = ns(locked_at - wait_started);
+    const uint64_t hold_ns = ns(unlocking_at - locked_at);
+    const uint64_t unref_ns = ns(unref_done - unref_started);
+    self->handoff_lock_samples_.fetch_add(1, std::memory_order_relaxed);
+    self->handoff_wait_ns_.fetch_add(wait_ns, std::memory_order_relaxed);
+    self->handoff_hold_ns_.fetch_add(hold_ns, std::memory_order_relaxed);
+    self->handoff_unref_ns_.fetch_add(unref_ns, std::memory_order_relaxed);
+    record_max(self->handoff_wait_max_ns_, wait_ns);
+    record_max(self->handoff_hold_max_ns_, hold_ns);
+    record_max(self->handoff_unref_max_ns_, unref_ns);
   }
 
   // Wake Init()'s condition variable on the very first frame. Also engage

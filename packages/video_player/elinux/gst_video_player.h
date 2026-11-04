@@ -88,6 +88,33 @@ class GstVideoPlayer {
   uint64_t TakeTransparentFrameCount() {
     return transparent_frames_.exchange(0, std::memory_order_relaxed);
   }
+  // TEXTURE_DIAG: how long HandoffHandler waited for and then held
+  // mutex_buffer_ (exclusive) per frame, and how much of the hold was the
+  // gst_buffer_unref of the previous frame. A long hold is the window in
+  // which GetFrameBuffer()'s try_lock fails (frame_lock_busy).
+  struct HandoffLockStats {
+    uint64_t samples = 0;
+    uint64_t wait_ns = 0;
+    uint64_t wait_max_ns = 0;
+    uint64_t hold_ns = 0;
+    uint64_t hold_max_ns = 0;
+    uint64_t unref_ns = 0;
+    uint64_t unref_max_ns = 0;
+  };
+  HandoffLockStats TakeHandoffLockStats() {
+    HandoffLockStats stats;
+    stats.samples = handoff_lock_samples_.exchange(0, std::memory_order_relaxed);
+    stats.wait_ns = handoff_wait_ns_.exchange(0, std::memory_order_relaxed);
+    stats.wait_max_ns =
+        handoff_wait_max_ns_.exchange(0, std::memory_order_relaxed);
+    stats.hold_ns = handoff_hold_ns_.exchange(0, std::memory_order_relaxed);
+    stats.hold_max_ns =
+        handoff_hold_max_ns_.exchange(0, std::memory_order_relaxed);
+    stats.unref_ns = handoff_unref_ns_.exchange(0, std::memory_order_relaxed);
+    stats.unref_max_ns =
+        handoff_unref_max_ns_.exchange(0, std::memory_order_relaxed);
+    return stats;
+  }
   // One SOC: line with temperature, CPU clock and firmware throttle flags.
   static void LogSocState();
 #ifdef USE_EGL_IMAGE_DMABUF
@@ -289,6 +316,14 @@ class GstVideoPlayer {
   std::atomic<bool> frame_diag_enabled_{false};
   std::atomic<uint64_t> black_frames_{0};
   std::atomic<uint64_t> transparent_frames_{0};
+  // See TakeHandoffLockStats(). Written by the streaming thread only.
+  std::atomic<uint64_t> handoff_lock_samples_{0};
+  std::atomic<uint64_t> handoff_wait_ns_{0};
+  std::atomic<uint64_t> handoff_wait_max_ns_{0};
+  std::atomic<uint64_t> handoff_hold_ns_{0};
+  std::atomic<uint64_t> handoff_hold_max_ns_{0};
+  std::atomic<uint64_t> handoff_unref_ns_{0};
+  std::atomic<uint64_t> handoff_unref_max_ns_{0};
   // Raster thread only (GetFrameBuffer). Current run of bad frames (0 = none,
   // 1 = black, 2 = transparent) and the FLASH line rate limiter.
   int bad_frame_kind_ = 0;
