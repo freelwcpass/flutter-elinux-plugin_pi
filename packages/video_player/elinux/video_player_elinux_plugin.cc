@@ -600,8 +600,10 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
               instance->buffer_mutex.unlock();
               return nullptr;
             }
-            instance->buffer->width = player->GetWidth();
-            instance->buffer->height = player->GetHeight();
+            // Size of the frame GetFrameBuffer() actually returned (it may be
+            // the previous frame), not of the latest decoded one.
+            instance->buffer->width = player->GetFrameWidth();
+            instance->buffer->height = player->GetFrameHeight();
             instance->buffer->buffer = frame;
             instance->buffer->release_callback = [](void* ctx) {
               auto* player = static_cast<FlutterVideoPlayer*>(ctx);
@@ -1232,8 +1234,9 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
         stats.texture_no_player.exchange(0, std::memory_order_relaxed);
     const uint64_t no_frame =
         stats.texture_no_frame.exchange(0, std::memory_order_relaxed);
-    // Subset of no_frame: the frame existed but a handoff held the player's
-    // buffer lock. The rest of no_frame means no decoded frame yet.
+    // Refreshes in which a handoff held the player's buffer lock. The previous
+    // frame was re-returned (counted in returned), unless none had been
+    // copied yet (counted in no_frame).
     uint64_t frame_lock_busy = 0;
     uint64_t black_frames = 0;
     uint64_t transparent_frames = 0;
@@ -1296,7 +1299,7 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
     }
     // Decode-thread side of mutex_buffer_: wait = blocked behind a frame copy,
     // hold = exclusive section (frame_lock_busy window), unref = previous
-    // frame's gst_buffer_unref inside that section.
+    // frame's gst_buffer_unref, done after the section.
     if (handoff.samples > 0) {
       const double n = static_cast<double>(handoff.samples);
       line << " handoff_wait_avg_ms=" << (handoff.wait_ns / n / 1000000.0)

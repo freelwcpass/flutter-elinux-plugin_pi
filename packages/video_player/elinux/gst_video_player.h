@@ -70,8 +70,8 @@ class GstVideoPlayer {
   // copy), which would otherwise hold the sound device past dispose.
   void ReleasePipeline();
   // TEXTURE_DIAG: number of GetFrameBuffer() calls since the last read that
-  // returned no frame because a frame handoff held mutex_buffer_. Each one is
-  // a raster pass in which the engine has nothing to paint for this texture.
+  // found mutex_buffer_ held by a frame handoff. Each one re-returned the
+  // previous frame (or, before the first copy, no frame at all).
   uint64_t TakeFrameLockBusyCount() {
     return frame_lock_busy_.exchange(0, std::memory_order_relaxed);
   }
@@ -89,8 +89,8 @@ class GstVideoPlayer {
     return transparent_frames_.exchange(0, std::memory_order_relaxed);
   }
   // TEXTURE_DIAG: how long HandoffHandler waited for and then held
-  // mutex_buffer_ (exclusive) per frame, and how much of the hold was the
-  // gst_buffer_unref of the previous frame. A long hold is the window in
+  // mutex_buffer_ (exclusive) per frame, and how long the gst_buffer_unref of
+  // the previous frame took (done after unlocking). The hold is the window in
   // which GetFrameBuffer()'s try_lock fails (frame_lock_busy).
   struct HandoffLockStats {
     uint64_t samples = 0;
@@ -122,6 +122,11 @@ class GstVideoPlayer {
 #endif  // USE_EGL_IMAGE_DMABUF
   int32_t GetWidth() const { return width_; };
   int32_t GetHeight() const { return height_; };
+  // Raster thread only, after GetFrameBuffer(): size of the frame it returned.
+  // Can differ from GetWidth()/GetHeight() when it re-returned the previous
+  // frame, so the texture must be sized from these.
+  int32_t GetFrameWidth() const { return frame_width_; };
+  int32_t GetFrameHeight() const { return frame_height_; };
   bool IsInitialized() const { return initialized_.load(); }
 
   // ADD THIS METHOD DECLARATION
@@ -249,7 +254,14 @@ class GstVideoPlayer {
   std::atomic<bool> first_network_chunk_logged_{false};
   std::atomic<bool> first_http_burst_logged_{false};
   std::atomic<bool> hls_demux_ready_logged_{false};
+  // Raster thread only (GetFrameBuffer): the last frame copied for Flutter,
+  // its size, and the allocated pixel count. Never touched by the streaming
+  // thread, so GetFrameBuffer() can re-return it without mutex_buffer_.
   std::unique_ptr<uint32_t[]> pixels_;
+  size_t pixels_capacity_ = 0;
+  int32_t frame_width_ = 0;
+  int32_t frame_height_ = 0;
+  // Size of gst_.buffer; written by HandoffHandler under mutex_buffer_.
   int32_t width_ = 0;
   int32_t height_ = 0;
   double volume_ = 1.0;
