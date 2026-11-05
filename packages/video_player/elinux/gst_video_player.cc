@@ -4046,5 +4046,10 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
     default:
       break;
   }
+  // A sync handler that returns GST_BUS_DROP owns the message and must unref
+  // it (see GstBusSyncHandler in gstbus.h). Without this every bus message
+  // leaked, and each holds a ref on its source, so every disposed pipeline and
+  // all its elements stayed alive (~13 fds and ~6 MB per player start).
+  gst_message_unref(message);
   return GST_BUS_DROP;
 }
