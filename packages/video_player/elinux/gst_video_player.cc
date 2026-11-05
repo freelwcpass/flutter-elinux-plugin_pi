@@ -1412,25 +1412,41 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
   return nullptr;
 #else
   // This runs from Flutter's raster thread. Never wait for the streaming
-  // thread to finish swapping buffers; skipping one texture refresh keeps
-  // input and overlays responsive and the next decoded frame retries.
+  // thread to finish swapping buffers, so input and overlays stay responsive.
+  // If a swap holds the lock, hand Flutter the previous frame again: returning
+  // no frame makes the engine paint nothing for this texture on that refresh,
+  // which shows as a black flash. pixels_ is raster-thread only, so re-
+  // returning it needs no lock.
   std::shared_lock<std::shared_mutex> lock(mutex_buffer_, std::try_to_lock);
   if (!lock.owns_lock()) {
     frame_lock_busy_.fetch_add(1, std::memory_order_relaxed);
+    if (pixels_ && frame_width_ > 0 && frame_height_ > 0) {
+      if (frame_diag_enabled_.load(std::memory_order_relaxed)) {
+        LogFlash("kind=reused_previous_frame reason=frame_swap_in_progress");
+      }
+      return reinterpret_cast<const uint8_t*>(pixels_.get());
+    }
     if (frame_diag_enabled_.load(std::memory_order_relaxed)) {
       LogFlash("kind=no_frame reason=frame_swap_in_progress");
     }
     return nullptr;
   }
-  if (!gst_.buffer) {
+  if (!gst_.buffer || width_ <= 0 || height_ <= 0) {
     if (frame_diag_enabled_.load(std::memory_order_relaxed)) {
       LogFlash("kind=no_frame reason=no_decoded_frame");
     }
     return nullptr;
   }
 
-  const uint32_t pixel_bytes = width_ * height_ * 4;
-  gst_buffer_extract(gst_.buffer, 0, pixels_.get(), pixel_bytes);
+  const size_t pixel_count =
+      static_cast<size_t>(width_) * static_cast<size_t>(height_);
+  if (pixel_count > pixels_capacity_) {
+    pixels_.reset(new uint32_t[pixel_count]);
+    pixels_capacity_ = pixel_count;
+  }
+  frame_width_ = width_;
+  frame_height_ = height_;
+  gst_buffer_extract(gst_.buffer, 0, pixels_.get(), pixel_count * 4);
   if (frame_diag_enabled_.load(std::memory_order_relaxed)) {
     ClassifyFrameForDiagnostics();
   }
@@ -1443,15 +1459,15 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 // black in the content also counts, so the FLASH start/end lines (a run of
 // one or two refreshes between normal frames) matter more than the counts.
 void GstVideoPlayer::ClassifyFrameForDiagnostics() {
-  if (width_ <= 0 || height_ <= 0 || !pixels_) return;
+  if (frame_width_ <= 0 || frame_height_ <= 0 || !pixels_) return;
   const auto* px = reinterpret_cast<const uint8_t*>(pixels_.get());
   bool all_dark = true;
   bool all_clear = true;
   for (int gy = 0; gy < 8; ++gy) {
     for (int gx = 0; gx < 8; ++gx) {
-      const size_t x = static_cast<size_t>((2 * gx + 1) * width_ / 16);
-      const size_t y = static_cast<size_t>((2 * gy + 1) * height_ / 16);
-      const uint8_t* p = px + (y * static_cast<size_t>(width_) + x) * 4;
+      const size_t x = static_cast<size_t>((2 * gx + 1) * frame_width_ / 16);
+      const size_t y = static_cast<size_t>((2 * gy + 1) * frame_height_ / 16);
+      const uint8_t* p = px + (y * static_cast<size_t>(frame_width_) + x) * 4;
       if (p[0] >= 16 || p[1] >= 16 || p[2] >= 16) all_dark = false;
       if (p[3] != 0) all_clear = false;
     }
@@ -2363,27 +2379,32 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   gst_structure_get_int(structure, "height", &height);
   gst_caps_unref(caps);
 
-  // TEXTURE_DIAG only: time the exclusive section below. Measurement only —
-  // the locking and the order of operations are unchanged.
+  // Keep the exclusive section to a pointer swap. Every moment it is held is
+  // a window in which GetFrameBuffer()'s try_lock fails (frame_lock_busy);
+  // unreffing the previous frame in here (returning it to v4l2convert's pool,
+  // ~0.2 ms avg and up to 6 ms measured on the Pi) was ~99% of that window.
+  // Unreffing after unlock is safe: GetFrameBuffer() only reads gst_.buffer
+  // under the lock, so once it is swapped no copy can still reach the old one.
+  // DestroyPipeline()'s NULL transition waits for this handler to return, so
+  // the old frame still goes back to its pool before the pool is deactivated.
+  //
+  // TEXTURE_DIAG only: time the wait, the exclusive section and the unref.
   const bool timed = self->frame_diag_enabled_.load(std::memory_order_relaxed);
-  std::chrono::steady_clock::time_point wait_started, locked_at, unref_started,
-      unref_done, unlocking_at;
+  std::chrono::steady_clock::time_point wait_started, locked_at, unlocking_at,
+      unref_done;
   if (timed) wait_started = std::chrono::steady_clock::now();
+  GstBuffer* previous = nullptr;
   {
     std::lock_guard<std::shared_mutex> lock(self->mutex_buffer_);
     if (timed) locked_at = std::chrono::steady_clock::now();
-    if (width != self->width_ || height != self->height_) {
-      self->width_ = width;
-      self->height_ = height;
-      if (width > 0 && height > 0)
-        self->pixels_.reset(new uint32_t[width * height]);
-    }
-    if (timed) unref_started = std::chrono::steady_clock::now();
-    if (self->gst_.buffer) gst_buffer_unref(self->gst_.buffer);
-    if (timed) unref_done = std::chrono::steady_clock::now();
+    self->width_ = width;
+    self->height_ = height;
+    previous = self->gst_.buffer;
     self->gst_.buffer = gst_buffer_ref(buf);
     if (timed) unlocking_at = std::chrono::steady_clock::now();
   }
+  if (previous) gst_buffer_unref(previous);
+  if (timed) unref_done = std::chrono::steady_clock::now();
   if (timed) {
     auto ns = [](std::chrono::steady_clock::duration d) {
       return static_cast<uint64_t>(
@@ -2397,7 +2418,7 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
     };
     const uint64_t wait_ns = ns(locked_at - wait_started);
     const uint64_t hold_ns = ns(unlocking_at - locked_at);
-    const uint64_t unref_ns = ns(unref_done - unref_started);
+    const uint64_t unref_ns = ns(unref_done - unlocking_at);
     self->handoff_lock_samples_.fetch_add(1, std::memory_order_relaxed);
     self->handoff_wait_ns_.fetch_add(wait_ns, std::memory_order_relaxed);
     self->handoff_hold_ns_.fetch_add(hold_ns, std::memory_order_relaxed);
