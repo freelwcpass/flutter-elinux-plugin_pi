@@ -14,21 +14,36 @@
 #include <gst/video/video.h>
 #endif  // USE_EGL_IMAGE_DMABUF
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
+#include <vector>
+
+struct AuthHeaders {
+  std::map<std::string, std::string> all_headers;  // Store ALL headers as a map
+};
 
 #include "video_player_stream_handler.h"
 
 class GstVideoPlayer {
  public:
   GstVideoPlayer(const std::string& uri,
-                 std::unique_ptr<VideoPlayerStreamHandler> handler);
+                 std::unique_ptr<VideoPlayerStreamHandler> handler,
+                 std::vector<std::string> supported_video_codecs);
   ~GstVideoPlayer();
 
   static void GstLibraryLoad();
   static void GstLibraryUnload();
+
+  void LogPlaybackStartup(const char* stage,
+                          const std::string& details = "") const;
 
   bool Init();
   bool Play();
@@ -36,16 +51,96 @@ class GstVideoPlayer {
   bool Stop();
   bool SetVolume(double volume);
   bool SetPlaybackRate(double rate);
-  void SetAutoRepeat(bool auto_repeat) { auto_repeat_ = auto_repeat; };
+  // Looping is force-disabled. The app never intends to loop any content (no
+  // setLooping originates from soatv); the zeroratehls wrapper enables it by
+  // default, which on a LIVE stream turns a spurious souphttpsrc EOS into a
+  // SetSeek(0) replay of the buffered window — the "same buffer loops" bug
+  // (continuous frames + Current Position resetting ~30s→0). With auto_repeat_
+  // pinned false, a live EOS never seeks-to-0; frames just stop and the
+  // frame-arrival watchdog reconnects (clean, like curl). Re-enable per-stream
+  // via a real live flag if VOD looping is ever genuinely needed.
+  void SetAutoRepeat(bool /*auto_repeat*/) { auto_repeat_ = false; };
   bool SetSeek(int64_t position);
   int64_t GetDuration();
   int64_t GetCurrentPosition();
   const uint8_t* GetFrameBuffer();
+  // Stops the pipeline and frees the ALSA device and decoder now, on the
+  // calling thread. Called from DisposePlayer() because the last reference to
+  // this object may be dropped later on another thread (an in-flight texture
+  // copy), which would otherwise hold the sound device past dispose.
+  void ReleasePipeline();
+  // TEXTURE_DIAG: number of GetFrameBuffer() calls since the last read that
+  // found mutex_buffer_ held by a frame handoff. Each one re-returned the
+  // previous frame (or, before the first copy, no frame at all).
+  uint64_t TakeFrameLockBusyCount() {
+    return frame_lock_busy_.exchange(0, std::memory_order_relaxed);
+  }
+  // TEXTURE_DIAG frame analysis. When enabled, GetFrameBuffer() samples each
+  // frame it hands to Flutter and counts frames that are black (RGB all dark)
+  // or transparent (alpha 0, drawn as whatever is behind the texture), and
+  // logs rate-limited FLASH lines for those and for refreshes with no frame.
+  void SetFrameDiagnostics(bool enabled) {
+    frame_diag_enabled_.store(enabled, std::memory_order_relaxed);
+  }
+  uint64_t TakeBlackFrameCount() {
+    return black_frames_.exchange(0, std::memory_order_relaxed);
+  }
+  uint64_t TakeTransparentFrameCount() {
+    return transparent_frames_.exchange(0, std::memory_order_relaxed);
+  }
+  // TEXTURE_DIAG: how long HandoffHandler waited for and then held
+  // mutex_buffer_ (exclusive) per frame, and how long the gst_buffer_unref of
+  // the previous frame took (done after unlocking). The hold is the window in
+  // which GetFrameBuffer()'s try_lock fails (frame_lock_busy).
+  struct HandoffLockStats {
+    uint64_t samples = 0;
+    uint64_t wait_ns = 0;
+    uint64_t wait_max_ns = 0;
+    uint64_t hold_ns = 0;
+    uint64_t hold_max_ns = 0;
+    uint64_t unref_ns = 0;
+    uint64_t unref_max_ns = 0;
+  };
+  HandoffLockStats TakeHandoffLockStats() {
+    HandoffLockStats stats;
+    stats.samples = handoff_lock_samples_.exchange(0, std::memory_order_relaxed);
+    stats.wait_ns = handoff_wait_ns_.exchange(0, std::memory_order_relaxed);
+    stats.wait_max_ns =
+        handoff_wait_max_ns_.exchange(0, std::memory_order_relaxed);
+    stats.hold_ns = handoff_hold_ns_.exchange(0, std::memory_order_relaxed);
+    stats.hold_max_ns =
+        handoff_hold_max_ns_.exchange(0, std::memory_order_relaxed);
+    stats.unref_ns = handoff_unref_ns_.exchange(0, std::memory_order_relaxed);
+    stats.unref_max_ns =
+        handoff_unref_max_ns_.exchange(0, std::memory_order_relaxed);
+    return stats;
+  }
+  // One SOC: line with temperature, CPU clock and firmware throttle flags.
+  static void LogSocState();
 #ifdef USE_EGL_IMAGE_DMABUF
   void* GetEGLImage(void* egl_display, void* egl_context);
 #endif  // USE_EGL_IMAGE_DMABUF
   int32_t GetWidth() const { return width_; };
   int32_t GetHeight() const { return height_; };
+  // Raster thread only, after GetFrameBuffer(): size of the frame it returned.
+  // Can differ from GetWidth()/GetHeight() when it re-returned the previous
+  // frame, so the texture must be sized from these.
+  int32_t GetFrameWidth() const { return frame_width_; };
+  int32_t GetFrameHeight() const { return frame_height_; };
+  bool IsInitialized() const { return initialized_.load(); }
+
+  // ADD THIS METHOD DECLARATION
+  void SetAuthHeaders(const std::map<std::string, std::string>& headers);
+
+  // Last error string set on this player (via NotifyErrorOnce). The plugin's
+  // create() reply must carry the specific error text through — the Dart
+  // side's event channel is not yet connected when Init() runs, so an
+  // OnNotifyError() dispatch at that stage is not observable to Dart, and the
+  // create-method-channel reply is the only signal Dart receives on init
+  // failure. Returns an empty string if no error was ever recorded.
+  std::string GetLastError() const { return last_error_; }
+
+  AuthHeaders auth_headers_;
 
  private:
   struct GstVideoElements {
@@ -65,25 +160,329 @@ class GstVideoPlayer {
   std::string ParseUri(const std::string& uri);
   bool CreatePipeline();
   void DestroyPipeline();
+  bool DisableAudioSink();
   bool Preroll();
   void GetVideoSize(int32_t& width, int32_t& height);
+  void StartWatchdog();
+  void StopWatchdog();
+  // Force pipeline recovery when stuck (frames not advancing for several
+  // seconds, network healthy, buffer stable). Cycles PAUSED -> PLAYING rather
+  // than attempting a seek — the seek-based approach in 74ad4f9 returned
+  // false on device 2026-08-03, likely because live HLS pipelines don't
+  // accept seek events in their default configuration.
+  bool TryFlushRecovery();
+  // Append a bus-message summary to bus_msg_ring_. Called from
+  // HandleGstMessage on every message. Trims to the last 20 entries.
+  void PushBusMsgRing(const std::string& type, const std::string& src_name,
+                      const std::string& extra);
+  // Print the current bus-message ring buffer to stdout. Called from
+  // LogPlaybackHealth when a buffer collapse is detected.
+  void DumpBusMsgRing();
+  // Fire OnNotifyError at most once (matches the watchdog/error single-fire
+  // guard) and stop the watchdog. Used by both the fatal-error path and the
+  // entitlement-unavailable path so they never double-notify.
+  void NotifyErrorOnce(const std::string& message);
+  void StartAbrEngine();
+  void StopAbrEngine();
+  void AbrTick();
+  void CloseBurstLocked();
+  void LogPlaybackHealth(GstState state, uint64_t frames,
+                         std::chrono::steady_clock::time_point now,
+                         std::chrono::steady_clock::time_point last_frame_time);
+  static void DeepElementAddedHandler(GstBin* bin, GstBin* sub_bin,
+                                      GstElement* element, gpointer user_data);
+  static gint AutoplugSelectCallback(
+      GstElement* decodebin, GstPad* pad, GstCaps* caps,
+      GstElementFactory* factory, gpointer user_data);
+  static gboolean SelectStreamCallback(GstElement* decodebin,
+                                       GstStreamCollection* collection,
+                                       GstStream* stream, gpointer user_data);
+  static GstPadProbeReturn AbrThroughputProbe(GstPad* pad,
+                                              GstPadProbeInfo* info,
+                                              gpointer user_data);
+  void ConfigureAdaptiveDemux2(GstElement* demux);
+  static void AdaptiveDemuxPadAdded(GstElement* demux, GstPad* pad,
+                                    gpointer user_data);
+  static GstPadProbeReturn AdaptiveDemuxOutputProbe(GstPad* pad,
+                                                    GstPadProbeInfo* info,
+                                                    gpointer user_data);
+  void PollAdaptiveDemuxBandwidth();
+  bool IsVideoCodecAllowed(const GstCaps* caps) const;
+  void ClassifyFrameForDiagnostics();
+  void LogFlash(const std::string& detail);
 #ifdef USE_EGL_IMAGE_DMABUF
   void UnrefEGLImage();
 #endif  // USE_EGL_IMAGE_DMABUF
 
   GstVideoElements gst_;
+  // Held reference to the "volume" element inside our custom audio bin. We
+  // wrap alsasink in a bin, which means playbin's own "mute" property has no
+  // GstStreamVolume interface to forward to on this pipeline (the alsasink
+  // bin doesn't implement one), and mute silently no-ops. Driving this
+  // element directly gives us a working mute during the preroll gate.
+  GstElement* audio_volume_ = nullptr;
+  // ALSA playback devices are often exclusive on embedded images. If another
+  // process (or a just-torn-down reconnect) owns the device, keep video alive
+  // with a silent sink instead of failing the whole pipeline.
+  bool audio_disabled_ = false;
+  std::atomic<bool> audio_device_busy_{false};
+  // The ALSA open failed with ENOTSUPP (524): HDMI audio isn't available for
+  // the attached sink (no EDID / DVI). Retrying can't help, so Preroll() goes
+  // straight to the silent fallback.
+  std::atomic<bool> audio_device_unsupported_{false};
+  // True while Preroll() runs; only then is playsink's follow-up error to a
+  // failed ALSA open handled natively instead of being reported to Dart.
+  std::atomic<bool> in_preroll_{false};
   std::string uri_;
+  std::vector<std::string> supported_video_codecs_;
+  // Private metadata parsed from the `#soatv:` URI fragment. startup_kbps
+  // selects the cold-start rung; trace and offset_ms join native diagnostics
+  // to the app-side startup timeline. The fragment is stripped before playbin.
+  guint64 startup_kbps_hint_ = 0;
+  // Pipeline selection. playbin3 is opted into per stream with the
+  // `#soatv:pipeline=playbin3` URI fragment or for the whole process with
+  // SOATV_PIPELINE=playbin3; otherwise the legacy playbin path is unchanged.
+  // CreatePipeline() falls back to playbin if playbin3 can't be created.
+  bool use_playbin3_ = false;
+  // Cold-start connection speed chosen in CreatePipeline(). playbin forwards
+  // it to legacy hlsdemux itself; hlsdemux2 gets it in ConfigureAdaptiveDemux2.
+  guint64 startup_conn_kbps_ = 0;
+  std::string startup_trace_id_ = "native";
+  int64_t startup_elapsed_offset_ms_ = 0;
+  std::chrono::steady_clock::time_point startup_started_at_ =
+      std::chrono::steady_clock::now();
+  std::atomic<bool> first_network_chunk_logged_{false};
+  std::atomic<bool> first_http_burst_logged_{false};
+  std::atomic<bool> hls_demux_ready_logged_{false};
+  // Raster thread only (GetFrameBuffer): the last frame copied for Flutter,
+  // its size, and the allocated pixel count. Never touched by the streaming
+  // thread, so GetFrameBuffer() can re-return it without mutex_buffer_.
   std::unique_ptr<uint32_t[]> pixels_;
-  int32_t width_;
-  int32_t height_;
+  size_t pixels_capacity_ = 0;
+  int32_t frame_width_ = 0;
+  int32_t frame_height_ = 0;
+  // Size of gst_.buffer; written by HandoffHandler under mutex_buffer_.
+  int32_t width_ = 0;
+  int32_t height_ = 0;
   double volume_ = 1.0;
   double playback_rate_ = 1.0;
   bool mute_ = false;
   bool auto_repeat_ = false;
   bool is_completed_ = false;
+  // True when the source is LIVE (set in Preroll from
+  // GST_STATE_CHANGE_NO_PREROLL). A live stream has no end: EOS on it is
+  // spurious and must never be treated as completion (no seek-0, no 'completed'
+  // event) or it loops the buffered window.
+  bool is_live_ = false;
+  // Set when the Dart wrapper explicitly supplies stream_type metadata. This
+  // is authoritative and prevents a VOD URL containing "/live/" from being
+  // misclassified as an unseekable live stream.
+  bool stream_type_is_explicit_ = false;
+  // Seek state is shared by the platform thread, streaming thread, position
+  // queries and watchdog. A flushing HLS seek may temporarily make position
+  // unavailable and stop frames while new segments are fetched; retain the
+  // requested position and give that operation a bounded recovery window.
+  std::mutex seek_mutex_;
+  std::atomic<bool> seek_in_progress_{false};
+  std::atomic<int64_t> seek_target_ms_{0};
+  std::atomic<int64_t> last_known_position_ms_{0};
+  std::atomic<int64_t> last_seek_started_ticks_{0};
   std::mutex mutex_event_completed_;
   std::shared_mutex mutex_buffer_;
   std::unique_ptr<VideoPlayerStreamHandler> stream_handler_;
+  std::atomic<int> last_buffering_percent_{-1};
+  std::chrono::steady_clock::time_point buffering_log_start_time_ =
+      std::chrono::steady_clock::now();
+
+  // Stall watchdog: fires OnNotifyError only when the pipeline is PLAYING but
+  // no decoded video frame has reached the sink for kFrameStallTimeoutSecs —
+  // i.e. the picture is genuinely frozen. The old buffer-percent trigger was
+  // demoted to a diagnostic log: a buffering plateau (e.g. stuck at 78% at the
+  // live edge) is NOT a freeze if frames are still being rendered, and firing
+  // a full reconnect on it produced false positives that churned pipelines and
+  // ended in a crash. frames_handed_off_ moves only on a real buffer at the
+  // video sink (HandoffHandler), so it is the ground-truth liveness signal.
+  std::thread watchdog_thread_;
+  std::atomic<bool> watchdog_running_{false};
+  std::atomic<bool> error_notified_{
+      false};  // single-fire guard for OnNotifyError
+  // Last error message stored alongside the single-fire guard. Read by
+  // GetLastError() so the create-method-channel reply can carry the specific
+  // error text (e.g. NETWORK_TOO_SLOW:) when Init() fails. Written only under
+  // the same compare_exchange_strong that flips error_notified_ true.
+  std::string last_error_;
+  // Consecutive HTTP 401/403/410 failures from the HTTP source. A live stream
+  // whose subscription/entitlement has lapsed 4xx's every fetch; hlsdemux
+  // retries and swallows them (emitting EOS, which we ignore on live), so no
+  // fatal bus ERROR ever fires and playback silently loops the buffered
+  // remnant. Counting these warnings lets us detect that case and signal
+  // Flutter to check the subscription instead of reconnecting forever. Reset
+  // to 0 whenever a video frame advances (proof the stream is alive).
+  std::atomic<int> consecutive_unauthorized_{0};
+  std::atomic<bool> play_state_requested_{
+      false};  // tracks if user requested PLAYING
+  std::chrono::steady_clock::time_point last_buffering_progress_time_ =
+      std::chrono::steady_clock::now();
+  std::atomic<uint64_t> frames_handed_off_{0};  // bumped per video buffer
+  std::atomic<uint64_t> frame_lock_busy_{0};  // see TakeFrameLockBusyCount()
+  std::atomic<bool> frame_diag_enabled_{false};
+  std::atomic<uint64_t> black_frames_{0};
+  std::atomic<uint64_t> transparent_frames_{0};
+  // See TakeHandoffLockStats(). Written by the streaming thread only.
+  std::atomic<uint64_t> handoff_lock_samples_{0};
+  std::atomic<uint64_t> handoff_wait_ns_{0};
+  std::atomic<uint64_t> handoff_wait_max_ns_{0};
+  std::atomic<uint64_t> handoff_hold_ns_{0};
+  std::atomic<uint64_t> handoff_hold_max_ns_{0};
+  std::atomic<uint64_t> handoff_unref_ns_{0};
+  std::atomic<uint64_t> handoff_unref_max_ns_{0};
+  // Raster thread only (GetFrameBuffer). Current run of bad frames (0 = none,
+  // 1 = black, 2 = transparent) and the FLASH line rate limiter.
+  int bad_frame_kind_ = 0;
+  uint64_t bad_frame_run_ = 0;
+  int64_t flash_window_sec_ = -1;
+  int flash_lines_in_window_ = 0;
+  uint64_t flash_suppressed_ = 0;
+  // Previous tick's buffer_health_secs, used by LogPlaybackHealth to detect a
+  // sharp collapse (e.g. buffer dropping from 30s to 2s in one tick, which we
+  // have seen but never captured the cause of). Only touched from the watchdog
+  // thread. -1.0 means "no previous sample yet."
+  double prev_buffer_health_secs_ = -1.0;
+  // Ring buffer of recent bus messages, dumped when a buffer collapse fires.
+  // Purpose: identify which bus event caused the collapse (manifest refresh,
+  // discontinuity, flush-start, stream-start, etc.) rather than guessing.
+  // Written from the streaming thread inside HandleGstMessage; read from the
+  // watchdog thread inside LogPlaybackHealth. Protected by bus_msg_ring_mutex_.
+  // Kept small (last 20) so the streaming thread stays fast and the log dump
+  // stays readable.
+  struct BusMsgEntry {
+    std::chrono::steady_clock::time_point when;
+    std::string type;      // e.g. "STATE_CHANGED", "ELEMENT", "SEGMENT_DONE"
+    std::string src_name;  // element that emitted it, e.g. "hlsdemux0"
+    std::string extra;     // small type-specific detail (may be empty)
+  };
+  std::deque<BusMsgEntry> bus_msg_ring_;
+  std::mutex bus_msg_ring_mutex_;
+  // Last time we did a stuck-recovery flush. Guards against firing again too
+  // quickly if the first flush didn't take. Set by the watchdog thread.
+  std::chrono::steady_clock::time_point last_flush_recovery_time_;
+  std::mutex watchdog_mutex_;
+  std::condition_variable watchdog_cv_;
+
+  // --- ABR engine (Continuous Playback Intelligence) ---
+  // Measures per-segment download throughput with a pad probe on hlsdemux's
+  // sink pad, predicts sustainable bandwidth (harmonic mean + jitter
+  // discount), modulates it by buffer health, and steers hlsdemux's rendition
+  // selection through its connection-speed property (kbps). hlsdemux switches
+  // renditions at segment boundaries, so playback never interrupts.
+  std::thread abr_thread_;
+  std::atomic<bool> abr_running_{false};
+  std::mutex abr_mutex_;  // guards hls_demux_, burst state, abr_samples_
+  std::condition_variable abr_cv_;
+  GstElement* hls_demux_ = nullptr;  // ref held; released in DestroyPipeline
+  // True once the demuxer is adaptivedemux2's hlsdemux2. It downloads media
+  // segments with its own HTTP client, so they never cross the http source
+  // pad: throughput samples come from its "current-bandwidth" property and
+  // preroll progress bytes from its output pads instead.
+  std::atomic<bool> adaptive_demux2_{false};
+  guint64 last_demux2_bandwidth_bps_ = 0;  // ABR thread only
+  // Burst accumulator — written from the demuxer streaming thread. A gap in
+  // buffer arrivals marks the boundary between segment downloads.
+  guint64 burst_bytes_ = 0;
+  std::chrono::steady_clock::time_point burst_start_;
+  std::chrono::steady_clock::time_point burst_last_rx_;
+  // Total bytes seen at the http source pad since Init() began. Read atomically
+  // by the preroll gate to distinguish "network is genuinely dead" (bytes not
+  // accumulating) from "downstream is throttling" (bytes accumulating but the
+  // buffering signal capped). Written from the throughput-probe pad callback
+  // (which already holds abr_mutex_), so kept as an atomic for lock-free reads
+  // from the preroll thread. Never resets during a pipeline's lifetime.
+  // With hlsdemux2 the count comes from the demuxer's output pads instead.
+  std::atomic<uint64_t> total_bytes_fetched_{0};
+  // Completed per-burst throughput samples in bits/sec (newest at back).
+  std::deque<double> abr_samples_;
+  guint64 last_segment_bytes_ = 0;
+  double last_segment_download_secs_ = 0.0;
+  double last_segment_throughput_bps_ = 0.0;
+  // Policy state — touched only by the ABR thread.
+  guint64 published_kbps_ = 0;
+  std::chrono::steady_clock::time_point last_upswitch_time_;
+  // Timestamp of the last non-emergency down-switch. Used to enforce a
+  // cross-direction dwell: an up-switch immediately after a down-switch
+  // (seen 11:20:29 -> 11:20:30 on device) is quality thrash and often
+  // resolves to the same rung, so the second decision was pointless churn.
+  // Emergency down-switches deliberately do NOT stamp this — survival still
+  // beats hysteresis when the buffer is nearly gone.
+  std::chrono::steady_clock::time_point last_downswitch_time_;
+  int abr_heartbeat_counter_ = 0;
+  // Consecutive AbrTick cycles a >=20% drop has persisted below the buffer
+  // floor; a down-switch fires only once it reaches kSustainedDropTicks so a
+  // single noisy sample can't flap the rung. Reset whenever the drop clears.
+  int abr_drop_ticks_ = 0;
+  // Consecutive AbrTick cycles the predicted throughput has been below the
+  // currently-published rate. Separate from abr_drop_ticks_ because it fires
+  // regardless of buffer health — a sustained undershoot means the network
+  // genuinely can't sustain the current rung, so we should down-switch before
+  // the buffer drains rather than after. Reset whenever predicted catches up.
+  // Device log 2026-07-31 18:22:11-18:23:41 held 1091 kbps published while
+  // predicted was 446/517/257/307 kbps across four ticks (with buffer still
+  // healthy) — the ABR should have already been on a lower rung.
+  int abr_undershoot_ticks_ = 0;
+  // Consecutive AbrTick cycles the predicted throughput has been very much
+  // HIGHER than the currently-published rate (>=5x). Mirror of undershoot.
+  // Fires when the buffer is stuck low and the normal up-switch gate can't
+  // open. Device log 2026-08-03 14:14 saw published held at 177 kbps for 6+
+  // minutes while predicted showed 6-18 Mbps — the buffer never reached
+  // 15 s because 177 kbps starves the pipeline, so up-switch never fired.
+  int abr_trapped_ticks_ = 0;
+
+  // --- ABR calm-mode state (task #46, 2026-08-17) ---
+  //
+  // Timestamp of when this pipeline first reached PLAYING with frames. Set
+  // once from the ABR thread on the first tick where published_kbps_ moves
+  // from 0 to non-zero. Used by the fragile-up-switch gate to route the
+  // first up-switch through ABR_RESTART if it fires within a young-pipeline
+  // window (see kFragilePipelineSecs). Never touches anything else.
+  std::chrono::steady_clock::time_point first_publish_time_;
+  // Timestamp of the most recent BUFFER-COLLAPSE, set from the watchdog
+  // thread's LogPlaybackHealth. Atomic because ABR reads it cross-thread.
+  // Time-since-epoch of 0 means "never collapsed since pipeline start".
+  // Used to gate up-switches during the recovery-from-collapse window
+  // (BBC News 2026-08-17 10:47 crashed on an in-place up-switch 4s after
+  // a BUFFER-COLLAPSE while playbin was still re-plugging inputselectors).
+  std::atomic<int64_t> last_buffer_collapse_ns_{0};
+  // Timestamp of the most recent ABR decision of any kind (first-estimate,
+  // up-switch, down-switch, emergency, undershoot, trapped-rate escape).
+  // Enforces a global post-decision cooldown so we can't fire two ABR
+  // decisions in rapid succession. BBC News 2026-08-17 log showed 30 ABR
+  // restarts in 37 minutes, driving a 19x buffer-collapse rate vs the
+  // FAITH TV single-variant baseline (which had zero switches).
+  std::chrono::steady_clock::time_point last_abr_decision_time_;
+
+  // --- Frame-arrival tracking for buffer-emergency defer (task #34) ---
+  //
+  // AbrTick observes frames_handed_off_ each tick and stamps the wall-clock
+  // when the count actually advanced. Used by the buffer-emergency branch
+  // to skip a false ABR_RESTART when frames are still flowing: a healthy
+  // decoder + a briefly-drained multiqueue is transient (the queue refills
+  // as bytes arrive), NOT a real emergency. Device log 2026-08-29 01:58:04
+  // captured the exact false-positive shape: buffer 60s -> 5s in one tick,
+  // decoder continued at 30 fps through the "emergency", ABR_RESTART tore
+  // down a pipeline that was actively delivering frames. Only touched from
+  // the ABR thread.
+  uint64_t abr_last_seen_frames_ = 0;
+  std::chrono::steady_clock::time_point abr_last_frame_advance_time_;
+
+  // First-frame synchronisation: Init() advances to PLAYING then waits here
+  // until HandoffHandler delivers the first decoded frame so that video
+  // dimensions are known before OnNotifyInitialized() is called.
+  std::atomic<bool> first_frame_ready_{false};
+  std::mutex mutex_first_frame_;
+  std::condition_variable first_frame_cv_;
+
+  // Guards against calling OnNotifyInitialized() more than once (Init() and
+  // HandoffHandler can race on the deferred-init path).
+  std::atomic<bool> initialized_{false};
 
 #ifdef USE_EGL_IMAGE_DMABUF
   GstVideoInfo gst_video_info_;

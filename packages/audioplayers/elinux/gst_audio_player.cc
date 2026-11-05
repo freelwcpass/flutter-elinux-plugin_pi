@@ -4,7 +4,147 @@
 
 #include "gst_audio_player.h"
 
+#include <cstdlib>
+#include <cstdio>
+#include <fstream>
+#include <glob.h>
 #include <iostream>
+#include <string>
+
+// Pick the ALSA device associated with the connected HDMI connector. Keep
+// this local to the audio player so the existing video-player routing remains
+// unchanged.
+static bool ReadFirstLine(const std::string& path, std::string* line) {
+  std::ifstream f(path);
+  return f && std::getline(f, *line);
+}
+
+static std::string DeviceForAlsaCard(int card) {
+  char device[32];
+  std::snprintf(device, sizeof(device), "plughw:%d,0", card);
+  return device;
+}
+
+static bool FindAlsaCardById(const std::string& target_id, int* out_card) {
+  for (int card = 0; card < 32; ++card) {
+    char id_path[64];
+    std::snprintf(id_path, sizeof(id_path), "/proc/asound/card%d/id", card);
+    std::string id;
+    if (ReadFirstLine(id_path, &id) && id == target_id) {
+      *out_card = card;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool FindAnyHdmiAlsaCard(int* out_card, std::string* out_id) {
+  for (int card = 0; card < 32; ++card) {
+    char id_path[64];
+    std::snprintf(id_path, sizeof(id_path), "/proc/asound/card%d/id", card);
+    std::string id;
+    if (ReadFirstLine(id_path, &id) && id.rfind("vc4hdmi", 0) == 0) {
+      *out_card = card;
+      *out_id = id;
+      return true;
+    }
+  }
+  return false;
+}
+
+// hdmi_force_hotplug=1 / video=HDMI-A-1:...D make the connector report
+// "connected" even with no display attached. The vc4 HDMI audio driver then
+// has no EDID, decides the sink can't play audio and fails the PCM open with
+// ENOTSUPP (524). Only a non-empty EDID proves a real display is attached.
+static bool HdmiHasEdid(int hdmi_idx) {
+  char pattern[64];
+  std::snprintf(pattern, sizeof(pattern), "/sys/class/drm/card*-HDMI-A-%d/edid",
+                hdmi_idx);
+  glob_t g{};
+  bool has_edid = false;
+  if (glob(pattern, 0, nullptr, &g) == 0) {
+    for (size_t i = 0; i < g.gl_pathc && !has_edid; ++i) {
+      std::ifstream f(g.gl_pathv[i], std::ios::binary);
+      has_edid = f && f.get() != std::char_traits<char>::eof();
+    }
+  }
+  globfree(&g);
+  return has_edid;
+}
+
+static std::string PickAudioDevice() {
+  const char* override_device = std::getenv("AUDIOPLAYERS_ELINUX_ALSA_DEVICE");
+  if (override_device && override_device[0] != '\0') {
+    std::cout << "PickAudioDevice (audio): using override "
+              << override_device << std::endl;
+    return override_device;
+  }
+
+  bool forced_without_display = false;
+  for (int hdmi_idx = 1; hdmi_idx <= 4; ++hdmi_idx) {
+    char pattern[64];
+    std::snprintf(pattern, sizeof(pattern),
+                  "/sys/class/drm/card*-HDMI-A-%d/status", hdmi_idx);
+    glob_t g{};
+    if (glob(pattern, 0, nullptr, &g) != 0) {
+      globfree(&g);
+      continue;
+    }
+
+    bool connected = false;
+    for (size_t i = 0; i < g.gl_pathc; ++i) {
+      std::string status;
+      if (ReadFirstLine(g.gl_pathv[i], &status) && status == "connected") {
+        connected = true;
+        break;
+      }
+    }
+    globfree(&g);
+    if (!connected) {
+      continue;
+    }
+    if (!HdmiHasEdid(hdmi_idx)) {
+      std::cout << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
+                << " reports connected but has no EDID (forced hotplug, no "
+                   "display) — skipping HDMI audio"
+                << std::endl;
+      forced_without_display = true;
+      continue;
+    }
+
+    char target[16];
+    std::snprintf(target, sizeof(target), "vc4hdmi%d", hdmi_idx - 1);
+    int card = -1;
+    if (FindAlsaCardById(target, &card)) {
+      std::string device = DeviceForAlsaCard(card);
+      std::cout << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
+                << " connected, ALSA card " << card << " (" << target
+                << ") -> " << device << std::endl;
+      return device;
+    }
+
+    std::cerr << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
+              << " connected but no ALSA card matching '" << target
+              << "' found" << std::endl;
+  }
+
+  int hdmi_card = -1;
+  std::string hdmi_id;
+  // Guessing an HDMI card only helps when DRM can't tell us anything. When it
+  // said "connected" without a display, HDMI audio would fail with ENOTSUPP.
+  if (!forced_without_display && FindAnyHdmiAlsaCard(&hdmi_card, &hdmi_id)) {
+    std::string device = DeviceForAlsaCard(hdmi_card);
+    std::cout << "PickAudioDevice (audio): DRM did not report connected HDMI, "
+              << "using ALSA HDMI card " << hdmi_card << " (" << hdmi_id
+              << ") -> " << device << std::endl;
+    return device;
+  }
+
+  std::cout << "PickAudioDevice (audio): no vc4hdmi ALSA card found, "
+               "falling back to plughw:0,0"
+            << std::endl;
+  return "plughw:0,0";
+}
 
 GstAudioPlayer::GstAudioPlayer(
     const std::string &player_id,
@@ -46,12 +186,27 @@ bool GstAudioPlayer::CreatePipeline() {
     return false;
   }
 
-  // Setup stereo balance controller
-  gst_.panorama = gst_element_factory_make("audiopanorama", "audiopanorama");
-  if (gst_.panorama) {
-    gst_.audiobin = gst_bin_new(NULL);
-    gst_.audiosink = gst_element_factory_make("autoaudiosink", "autoaudiosink");
+  gst_.audiosink = gst_element_factory_make("alsasink", "alsasink");
+  if (!gst_.audiosink) {
+    std::cerr << "Failed to create alsasink" << std::endl;
+    return false;
+  }
+  // Hold our own references to the sink (and audiobin below). playbin's
+  // audio-sink and gst_bin_add take the floating reference, so without these
+  // the unrefs in Dispose() freed elements playbin had already freed.
+  gst_object_ref_sink(gst_.audiosink);
 
+  const std::string audio_device = PickAudioDevice();
+  g_object_set(G_OBJECT(gst_.audiosink), "device", audio_device.c_str(),
+               NULL);
+
+  // Setup stereo balance controller when the optional element is available.
+  gst_.panorama = gst_element_factory_make("audiopanorama", "audiopanorama");
+  if (!gst_.panorama) {
+    g_object_set(G_OBJECT(gst_.playbin), "audio-sink", gst_.audiosink, NULL);
+  } else {
+    gst_.audiobin = gst_bin_new(NULL);
+    gst_object_ref_sink(gst_.audiobin);
     gst_bin_add_many(GST_BIN(gst_.audiobin), gst_.panorama, gst_.audiosink, NULL);
     gst_element_link(gst_.panorama, gst_.audiosink);
 
@@ -72,7 +227,21 @@ bool GstAudioPlayer::CreatePipeline() {
   gst_.bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.playbin));
   gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this, NULL);
 
+  std::cout << "AUDIO-PIPELINE: created player=" << player_id_ << std::endl;
+
   return true;
+}
+
+void GstAudioPlayer::UpdateAudioDevice() {
+  if (!gst_.audiosink) {
+    return;
+  }
+
+  const std::string audio_device = PickAudioDevice();
+  std::cout << "UpdateAudioDevice (audio): setting device to " << audio_device
+            << std::endl;
+  g_object_set(G_OBJECT(gst_.audiosink), "device", audio_device.c_str(),
+               NULL);
 }
 
 // static
@@ -91,13 +260,13 @@ std::string GstAudioPlayer::ParseUri(const std::string& uri) {
     return uri;
   }
 
-  const auto* filename_uri = gst_filename_to_uri(uri.c_str(), NULL);
+  gchar* filename_uri = gst_filename_to_uri(uri.c_str(), NULL);
   if (!filename_uri) {
     std::cerr << "Faild to open " << uri.c_str() << std::endl;
     return uri;
   }
   std::string result_uri(filename_uri);
-  delete filename_uri;
+  g_free(filename_uri);
 
   return result_uri;
 }
@@ -165,22 +334,29 @@ void GstAudioPlayer::Seek(int64_t position) {
 
 void GstAudioPlayer::SetSourceUrl(std::string url) {
   if (url_ != url) {
+    std::cout << "AUDIO-SOURCE: player=" << player_id_ << " replacing source"
+              << std::endl;
     url_ = url;
+
+    // Update audio device in case HDMI was connected after app startup
+    UpdateAudioDevice();
 
     // flush unhandled messeges
     gst_bus_set_flushing(gst_.bus, TRUE);
     gst_element_set_state(gst_.playbin, GST_STATE_NULL);
+    gst_element_get_state(gst_.playbin, NULL, NULL, GST_CLOCK_TIME_NONE);
+    gst_bus_set_flushing(gst_.bus, FALSE);
     is_playing_ = false;
     if (!url_.empty()) {
       g_object_set(GST_OBJECT(gst_.playbin), "uri", url_.c_str(), NULL);
-      if (gst_.playbin->current_state != GST_STATE_READY) {
-        GstStateChangeReturn ret =
-            gst_element_set_state(gst_.playbin, GST_STATE_READY);
-        if (ret == GST_STATE_CHANGE_FAILURE) {
-          std::cerr <<
-            "Unable to set the pipeline to GST_STATE_READY." << std::endl;
-        }
+      GstStateChangeReturn ret =
+          gst_element_set_state(gst_.playbin, GST_STATE_READY);
+      if (ret == GST_STATE_CHANGE_FAILURE) {
+        std::cerr << "Unable to set the pipeline to GST_STATE_READY."
+                  << std::endl;
       }
+      std::cout << "AUDIO-PIPELINE: player=" << player_id_
+                << " prepared state=READY" << std::endl;
     }
     is_initialized_ = true;
   }
@@ -272,6 +448,7 @@ int64_t GstAudioPlayer::GetCurrentPosition() {
 }
 
 void GstAudioPlayer::Release() {
+  std::cout << "AUDIO-PIPELINE: releasing player=" << player_id_ << std::endl;
   is_playing_ = false;
   is_initialized_ = false;
   url_.clear();
@@ -281,6 +458,7 @@ void GstAudioPlayer::Release() {
   if (state > GST_STATE_NULL) {
     gst_bus_set_flushing(gst_.bus, TRUE);
     gst_element_set_state(gst_.playbin, GST_STATE_NULL);
+    gst_element_get_state(gst_.playbin, NULL, NULL, GST_CLOCK_TIME_NONE);
   }
 }
 
@@ -292,9 +470,17 @@ void GstAudioPlayer::Dispose() {
   is_playing_ = false;
   is_initialized_ = false;
   url_.clear();
+  std::cout << "AUDIO-PIPELINE: disposing player=" << player_id_ << std::endl;
+
+  // Go to NULL first: this closes the ALSA device before dispose() returns to
+  // Dart, so the next player can open plughw straight away.
+  gst_element_set_state(gst_.playbin, GST_STATE_NULL);
+  gst_element_get_state(gst_.playbin, NULL, NULL, GST_CLOCK_TIME_NONE);
+  std::cout << "AUDIO-PIPELINE: released audio device player=" << player_id_
+            << std::endl;
 
   if (gst_.bus) {
-    gst_bus_set_flushing(gst_.bus, TRUE);
+    gst_bus_set_sync_handler(gst_.bus, NULL, NULL, NULL);
     gst_object_unref(GST_OBJECT(gst_.bus));
     gst_.bus = nullptr;
   }
@@ -304,15 +490,20 @@ void GstAudioPlayer::Dispose() {
     gst_.source = nullptr;
   }
 
-  if (gst_.panorama) {
-    gst_element_set_state(gst_.audiobin, GST_STATE_NULL);
-    gst_element_remove_pad(gst_.audiobin, gst_.panoramasinkpad);
-    gst_bin_remove(GST_BIN(gst_.audiobin), gst_.audiosink);
-    gst_bin_remove(GST_BIN(gst_.audiobin), gst_.panorama);
-    gst_.panorama = nullptr;
+  gst_object_unref(GST_OBJECT(gst_.playbin));
+  // Our own references from CreatePipeline().
+  if (gst_.audiobin) {
+    gst_object_unref(GST_OBJECT(gst_.audiobin));
+  }
+  if (gst_.audiosink) {
+    gst_object_unref(GST_OBJECT(gst_.audiosink));
   }
 
   gst_.playbin = nullptr;
+  gst_.audiobin = nullptr;
+  gst_.panorama = nullptr;
+  gst_.audiosink = nullptr;
+  gst_.panoramasinkpad = nullptr;
 }
 
 // static
@@ -325,26 +516,27 @@ GstBusSyncReply GstAudioPlayer::HandleGstMessage(GstBus* bus,
       if (GST_MESSAGE_SRC(message) == GST_OBJECT(self->gst_.playbin)) {
         GstState old_state, new_state;
         gst_message_parse_state_changed(message, &old_state, &new_state, NULL);
-        if (new_state == GST_STATE_READY) {
-          if (gst_element_set_state(self->gst_.playbin, GST_STATE_PAUSED) ==
-              GST_STATE_CHANGE_FAILURE) {
-            g_printerr("Unable to set the pipeline from GST_STATE_READY "
-                "to GST_STATE_PAUSED\n");
-          }
-        }
+        std::cout << "AUDIO-PIPELINE-STATE: player=" << self->player_id_
+                  << " " << gst_element_state_get_name(old_state) << " -> "
+                  << gst_element_state_get_name(new_state) << std::endl;
       }
       break;
     }
     case GST_MESSAGE_EOS:
+      std::cout << "AUDIO-EOS: player=" << self->player_id_ << std::endl;
       self->is_completed_ = true;
       break;
     case GST_MESSAGE_WARNING: {
       gchar* debug;
       GError* error;
       gst_message_parse_warning(message, &error, &debug);
-      g_printerr("WARNING from element %s: %s\n", GST_OBJECT_NAME(message->src),
-                 error->message);
-      g_printerr("Warning details: %s\n", debug);
+      std::cerr << "AUDIO-WARNING: player=" << self->player_id_
+                << " element=" << GST_OBJECT_NAME(message->src) << ": "
+                << (error->message ? error->message : "unknown warning")
+                << std::endl;
+      if (debug && debug[0]) {
+        std::cerr << "AUDIO-WARNING-DEBUG: " << debug << std::endl;
+      }
       g_free(debug);
       g_error_free(error);
       break;
@@ -353,9 +545,13 @@ GstBusSyncReply GstAudioPlayer::HandleGstMessage(GstBus* bus,
       gchar* debug;
       GError* error;
       gst_message_parse_error(message, &error, &debug);
-      g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(message->src),
-                 error->message);
-      g_printerr("Error details: %s\n", debug);
+      std::cerr << "AUDIO-ERROR: player=" << self->player_id_
+                << " element=" << GST_OBJECT_NAME(message->src) << ": "
+                << (error->message ? error->message : "unknown error")
+                << std::endl;
+      if (debug && debug[0]) {
+        std::cerr << "AUDIO-ERROR-DEBUG: " << debug << std::endl;
+      }
       g_free(debug);
       g_error_free(error);
       break;
