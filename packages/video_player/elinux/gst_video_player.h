@@ -64,6 +64,59 @@ class GstVideoPlayer {
   int64_t GetDuration();
   int64_t GetCurrentPosition();
   const uint8_t* GetFrameBuffer();
+  // Stops the pipeline and frees the ALSA device and decoder now, on the
+  // calling thread. Called from DisposePlayer() because the last reference to
+  // this object may be dropped later on another thread (an in-flight texture
+  // copy), which would otherwise hold the sound device past dispose.
+  void ReleasePipeline();
+  // TEXTURE_DIAG: number of GetFrameBuffer() calls since the last read that
+  // returned no frame because a frame handoff held mutex_buffer_. Each one is
+  // a raster pass in which the engine has nothing to paint for this texture.
+  uint64_t TakeFrameLockBusyCount() {
+    return frame_lock_busy_.exchange(0, std::memory_order_relaxed);
+  }
+  // TEXTURE_DIAG frame analysis. When enabled, GetFrameBuffer() samples each
+  // frame it hands to Flutter and counts frames that are black (RGB all dark)
+  // or transparent (alpha 0, drawn as whatever is behind the texture), and
+  // logs rate-limited FLASH lines for those and for refreshes with no frame.
+  void SetFrameDiagnostics(bool enabled) {
+    frame_diag_enabled_.store(enabled, std::memory_order_relaxed);
+  }
+  uint64_t TakeBlackFrameCount() {
+    return black_frames_.exchange(0, std::memory_order_relaxed);
+  }
+  uint64_t TakeTransparentFrameCount() {
+    return transparent_frames_.exchange(0, std::memory_order_relaxed);
+  }
+  // TEXTURE_DIAG: how long HandoffHandler waited for and then held
+  // mutex_buffer_ (exclusive) per frame, and how much of the hold was the
+  // gst_buffer_unref of the previous frame. A long hold is the window in
+  // which GetFrameBuffer()'s try_lock fails (frame_lock_busy).
+  struct HandoffLockStats {
+    uint64_t samples = 0;
+    uint64_t wait_ns = 0;
+    uint64_t wait_max_ns = 0;
+    uint64_t hold_ns = 0;
+    uint64_t hold_max_ns = 0;
+    uint64_t unref_ns = 0;
+    uint64_t unref_max_ns = 0;
+  };
+  HandoffLockStats TakeHandoffLockStats() {
+    HandoffLockStats stats;
+    stats.samples = handoff_lock_samples_.exchange(0, std::memory_order_relaxed);
+    stats.wait_ns = handoff_wait_ns_.exchange(0, std::memory_order_relaxed);
+    stats.wait_max_ns =
+        handoff_wait_max_ns_.exchange(0, std::memory_order_relaxed);
+    stats.hold_ns = handoff_hold_ns_.exchange(0, std::memory_order_relaxed);
+    stats.hold_max_ns =
+        handoff_hold_max_ns_.exchange(0, std::memory_order_relaxed);
+    stats.unref_ns = handoff_unref_ns_.exchange(0, std::memory_order_relaxed);
+    stats.unref_max_ns =
+        handoff_unref_max_ns_.exchange(0, std::memory_order_relaxed);
+    return stats;
+  }
+  // One SOC: line with temperature, CPU clock and firmware throttle flags.
+  static void LogSocState();
 #ifdef USE_EGL_IMAGE_DMABUF
   void* GetEGLImage(void* egl_display, void* egl_context);
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -142,7 +195,16 @@ class GstVideoPlayer {
   static GstPadProbeReturn AbrThroughputProbe(GstPad* pad,
                                               GstPadProbeInfo* info,
                                               gpointer user_data);
+  void ConfigureAdaptiveDemux2(GstElement* demux);
+  static void AdaptiveDemuxPadAdded(GstElement* demux, GstPad* pad,
+                                    gpointer user_data);
+  static GstPadProbeReturn AdaptiveDemuxOutputProbe(GstPad* pad,
+                                                    GstPadProbeInfo* info,
+                                                    gpointer user_data);
+  void PollAdaptiveDemuxBandwidth();
   bool IsVideoCodecAllowed(const GstCaps* caps) const;
+  void ClassifyFrameForDiagnostics();
+  void LogFlash(const std::string& detail);
 #ifdef USE_EGL_IMAGE_DMABUF
   void UnrefEGLImage();
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -159,12 +221,27 @@ class GstVideoPlayer {
   // with a silent sink instead of failing the whole pipeline.
   bool audio_disabled_ = false;
   std::atomic<bool> audio_device_busy_{false};
+  // The ALSA open failed with ENOTSUPP (524): HDMI audio isn't available for
+  // the attached sink (no EDID / DVI). Retrying can't help, so Preroll() goes
+  // straight to the silent fallback.
+  std::atomic<bool> audio_device_unsupported_{false};
+  // True while Preroll() runs; only then is playsink's follow-up error to a
+  // failed ALSA open handled natively instead of being reported to Dart.
+  std::atomic<bool> in_preroll_{false};
   std::string uri_;
   std::vector<std::string> supported_video_codecs_;
   // Private metadata parsed from the `#soatv:` URI fragment. startup_kbps
   // selects the cold-start rung; trace and offset_ms join native diagnostics
   // to the app-side startup timeline. The fragment is stripped before playbin.
   guint64 startup_kbps_hint_ = 0;
+  // Pipeline selection. playbin3 is opted into per stream with the
+  // `#soatv:pipeline=playbin3` URI fragment or for the whole process with
+  // SOATV_PIPELINE=playbin3; otherwise the legacy playbin path is unchanged.
+  // CreatePipeline() falls back to playbin if playbin3 can't be created.
+  bool use_playbin3_ = false;
+  // Cold-start connection speed chosen in CreatePipeline(). playbin forwards
+  // it to legacy hlsdemux itself; hlsdemux2 gets it in ConfigureAdaptiveDemux2.
+  guint64 startup_conn_kbps_ = 0;
   std::string startup_trace_id_ = "native";
   int64_t startup_elapsed_offset_ms_ = 0;
   std::chrono::steady_clock::time_point startup_started_at_ =
@@ -235,6 +312,25 @@ class GstVideoPlayer {
   std::chrono::steady_clock::time_point last_buffering_progress_time_ =
       std::chrono::steady_clock::now();
   std::atomic<uint64_t> frames_handed_off_{0};  // bumped per video buffer
+  std::atomic<uint64_t> frame_lock_busy_{0};  // see TakeFrameLockBusyCount()
+  std::atomic<bool> frame_diag_enabled_{false};
+  std::atomic<uint64_t> black_frames_{0};
+  std::atomic<uint64_t> transparent_frames_{0};
+  // See TakeHandoffLockStats(). Written by the streaming thread only.
+  std::atomic<uint64_t> handoff_lock_samples_{0};
+  std::atomic<uint64_t> handoff_wait_ns_{0};
+  std::atomic<uint64_t> handoff_wait_max_ns_{0};
+  std::atomic<uint64_t> handoff_hold_ns_{0};
+  std::atomic<uint64_t> handoff_hold_max_ns_{0};
+  std::atomic<uint64_t> handoff_unref_ns_{0};
+  std::atomic<uint64_t> handoff_unref_max_ns_{0};
+  // Raster thread only (GetFrameBuffer). Current run of bad frames (0 = none,
+  // 1 = black, 2 = transparent) and the FLASH line rate limiter.
+  int bad_frame_kind_ = 0;
+  uint64_t bad_frame_run_ = 0;
+  int64_t flash_window_sec_ = -1;
+  int flash_lines_in_window_ = 0;
+  uint64_t flash_suppressed_ = 0;
   // Previous tick's buffer_health_secs, used by LogPlaybackHealth to detect a
   // sharp collapse (e.g. buffer dropping from 30s to 2s in one tick, which we
   // have seen but never captured the cause of). Only touched from the watchdog
@@ -272,6 +368,12 @@ class GstVideoPlayer {
   std::mutex abr_mutex_;  // guards hls_demux_, burst state, abr_samples_
   std::condition_variable abr_cv_;
   GstElement* hls_demux_ = nullptr;  // ref held; released in DestroyPipeline
+  // True once the demuxer is adaptivedemux2's hlsdemux2. It downloads media
+  // segments with its own HTTP client, so they never cross the http source
+  // pad: throughput samples come from its "current-bandwidth" property and
+  // preroll progress bytes from its output pads instead.
+  std::atomic<bool> adaptive_demux2_{false};
+  guint64 last_demux2_bandwidth_bps_ = 0;  // ABR thread only
   // Burst accumulator — written from the demuxer streaming thread. A gap in
   // buffer arrivals marks the boundary between segment downloads.
   guint64 burst_bytes_ = 0;
@@ -283,6 +385,7 @@ class GstVideoPlayer {
   // buffering signal capped). Written from the throughput-probe pad callback
   // (which already holds abr_mutex_), so kept as an atomic for lock-free reads
   // from the preroll thread. Never resets during a pipeline's lifetime.
+  // With hlsdemux2 the count comes from the demuxer's output pads instead.
   std::atomic<uint64_t> total_bytes_fetched_{0};
   // Completed per-burst throughput samples in bits/sec (newest at back).
   std::deque<double> abr_samples_;

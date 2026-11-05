@@ -13,12 +13,100 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iostream>
 #include <streambuf>
 #include <string>
 #include <vector>
+
+namespace {
+// Numeric GObject properties differ in type between elements and GStreamer
+// versions (connection-speed is guint on hlsdemux but guint64 on playbin,
+// bandwidth-target-ratio is a float) — go through GValue so the type always
+// matches. Both return false when the element lacks the property.
+bool SetNumericProperty(GstElement* element, const char* name, double value) {
+  GParamSpec* pspec =
+      g_object_class_find_property(G_OBJECT_GET_CLASS(element), name);
+  if (!pspec) return false;
+  GValue v = G_VALUE_INIT;
+  g_value_init(&v, pspec->value_type);
+  switch (G_TYPE_FUNDAMENTAL(pspec->value_type)) {
+    case G_TYPE_UINT:
+      g_value_set_uint(&v, static_cast<guint>(value));
+      break;
+    case G_TYPE_UINT64:
+      g_value_set_uint64(&v, static_cast<guint64>(value));
+      break;
+    case G_TYPE_INT:
+      g_value_set_int(&v, static_cast<gint>(value));
+      break;
+    case G_TYPE_INT64:
+      g_value_set_int64(&v, static_cast<gint64>(value));
+      break;
+    case G_TYPE_FLOAT:
+      g_value_set_float(&v, static_cast<gfloat>(value));
+      break;
+    case G_TYPE_DOUBLE:
+      g_value_set_double(&v, value);
+      break;
+    default:
+      g_value_unset(&v);
+      return false;
+  }
+  g_object_set_property(G_OBJECT(element), name, &v);
+  g_value_unset(&v);
+  return true;
+}
+
+bool GetNumericProperty(GstElement* element, const char* name, double* out) {
+  GParamSpec* pspec =
+      g_object_class_find_property(G_OBJECT_GET_CLASS(element), name);
+  if (!pspec || !(pspec->flags & G_PARAM_READABLE)) return false;
+  GValue v = G_VALUE_INIT;
+  g_value_init(&v, pspec->value_type);
+  g_object_get_property(G_OBJECT(element), name, &v);
+  bool ok = true;
+  switch (G_TYPE_FUNDAMENTAL(pspec->value_type)) {
+    case G_TYPE_UINT:
+      *out = g_value_get_uint(&v);
+      break;
+    case G_TYPE_UINT64:
+      *out = static_cast<double>(g_value_get_uint64(&v));
+      break;
+    case G_TYPE_INT:
+      *out = g_value_get_int(&v);
+      break;
+    case G_TYPE_INT64:
+      *out = static_cast<double>(g_value_get_int64(&v));
+      break;
+    case G_TYPE_FLOAT:
+      *out = g_value_get_float(&v);
+      break;
+    case G_TYPE_DOUBLE:
+      *out = g_value_get_double(&v);
+      break;
+    default:
+      ok = false;
+  }
+  g_value_unset(&v);
+  return ok;
+}
+
+// hlsdemux2 takes the rate in bits/sec as connection-bitrate and keeps
+// connection-speed (kbps) only as a deprecated alias; legacy hlsdemux has just
+// connection-speed. Either way the demuxer uses this figure instead of its
+// own measurement when picking a rendition.
+void SetConnectionSpeedKbps(GstElement* element, guint64 kbps) {
+  if (SetNumericProperty(element, "connection-bitrate",
+                         static_cast<double>(kbps) * 1000.0)) {
+    return;
+  }
+  SetNumericProperty(element, "connection-speed", static_cast<double>(kbps));
+}
+}  // namespace
 
 namespace {
 class TimestampedStreambuf final : public std::streambuf {
@@ -259,6 +347,30 @@ constexpr char kStreamUnavailablePrefix[] = "STREAM_UNAVAILABLE: ";
 // because retrying against the same slow link will keep failing the same way.
 constexpr char kNetworkTooSlowPrefix[] = "NETWORK_TOO_SLOW: ";
 
+// ENOTSUPP (524, "Unknown error 524" in alsa-lib's message): the vc4 HDMI
+// audio driver refuses to open because it believes the sink has no audio.
+bool IsAlsaDeviceUnsupported(const GError* error, const gchar* debug) {
+  std::string text;
+  if (error && error->message) text += error->message;
+  if (debug) {
+    if (!text.empty()) text += " ";
+    text += debug;
+  }
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return text.find("alsa") != std::string::npos &&
+         (text.find("error 524") != std::string::npos ||
+          text.find("not supported") != std::string::npos);
+}
+
+// playbin3's playsink posts this right after a failed ALSA open.
+bool IsAudioSinkNotWorking(const GError* error) {
+  if (!error || !error->message) return false;
+  const std::string text = error->message;
+  return text.find("audiosink") != std::string::npos &&
+         text.find("not working") != std::string::npos;
+}
+
 bool IsAlsaDeviceBusy(const GError* error, const gchar* debug) {
   std::string text;
   if (error && error->message) text += error->message;
@@ -426,6 +538,139 @@ void DumpKernelFreezeDiagnostic() {
     pclose(fp);
   }
 }
+
+// Box capability report, written once per process after gst_init so the app
+// (and support) can see what this device can play without starting a stream.
+constexpr char kCodecCapabilitiesPath[] = "/appdata/codec_capabilities.json";
+
+struct FactoryMatch {
+  std::vector<std::string> names;  // highest rank first
+  bool hardware = false;
+};
+
+// Element factories of `type` whose sink pad accepts `caps_str`.
+FactoryMatch FindFactoriesAccepting(GstElementFactoryListType type,
+                                    const char* caps_str) {
+  FactoryMatch match;
+  GList* all = gst_element_factory_list_get_elements(type, GST_RANK_MARGINAL);
+  GstCaps* caps = gst_caps_from_string(caps_str);
+  GList* hits = gst_element_factory_list_filter(all, caps, GST_PAD_SINK, FALSE);
+  hits = g_list_sort(hits, gst_plugin_feature_rank_compare_func);
+  for (GList* l = hits; l; l = l->next) {
+    auto* factory = GST_ELEMENT_FACTORY(l->data);
+    match.names.emplace_back(
+        gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)));
+    const gchar* klass =
+        gst_element_factory_get_metadata(factory, GST_ELEMENT_METADATA_KLASS);
+    if (klass && std::strstr(klass, "Hardware")) match.hardware = true;
+  }
+  gst_plugin_feature_list_free(hits);
+  gst_caps_unref(caps);
+  gst_plugin_feature_list_free(all);
+  return match;
+}
+
+bool HasFactory(const char* name) {
+  GstElementFactory* factory = gst_element_factory_find(name);
+  if (!factory) return false;
+  gst_object_unref(factory);
+  return true;
+}
+
+std::string JsonString(const std::string& value) {
+  std::string out = "\"";
+  for (const char c : value) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (static_cast<unsigned char>(c) >= 0x20) {
+      out += c;
+    }
+  }
+  return out + "\"";
+}
+
+std::string JsonStringArray(const std::vector<std::string>& values) {
+  std::string out = "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) out += ", ";
+    out += JsonString(values[i]);
+  }
+  return out + "]";
+}
+
+void WriteCodecCapabilities() {
+  // H.264: any video decoder that accepts it, hardware (v4l2h264dec) or not.
+  const FactoryMatch h264 = FindFactoriesAccepting(
+      static_cast<GstElementFactoryListType>(
+          GST_ELEMENT_FACTORY_TYPE_DECODER |
+          GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO),
+      "video/x-h264");
+  // AV1: same check. The Pi 4 has no AV1 hardware decoder, so expect either
+  // nothing or software decoders only (dav1ddec, av1dec, avdec_av1).
+  const FactoryMatch av1 = FindFactoriesAccepting(
+      static_cast<GstElementFactoryListType>(
+          GST_ELEMENT_FACTORY_TYPE_DECODER |
+          GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO),
+      "video/x-av1");
+  std::vector<std::string> hls_demuxers;
+  for (const char* name : {"hlsdemux2", "hlsdemux"}) {
+    if (HasFactory(name)) hls_demuxers.emplace_back(name);
+  }
+
+  char timestamp[32] = "";
+  const std::time_t now = std::time(nullptr);
+  std::tm utc{};
+  if (gmtime_r(&now, &utc)) {
+    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc);
+  }
+  gchar* gst_version = gst_version_string();
+
+  std::string json = "{\n";
+  json += "  \"generated_at\": " + JsonString(timestamp) + ",\n";
+  json += "  \"gstreamer_version\": " +
+          JsonString(gst_version ? gst_version : "") + ",\n";
+  json += "  \"h264\": {\"supported\": ";
+  json += h264.names.empty() ? "false" : "true";
+  json += ", \"hardware\": ";
+  json += h264.hardware ? "true" : "false";
+  json += ", \"decoders\": " + JsonStringArray(h264.names) + "},\n";
+  json += "  \"av1\": {\"supported\": ";
+  json += av1.names.empty() ? "false" : "true";
+  json += ", \"hardware\": ";
+  json += av1.hardware ? "true" : "false";
+  json += ", \"decoders\": " + JsonStringArray(av1.names) + "},\n";
+  json += "  \"hls_demuxers\": " + JsonStringArray(hls_demuxers) + "\n";
+  json += "}\n";
+  g_free(gst_version);
+
+  std::cout << "CODEC-CAPS: h264=" << (h264.names.empty() ? "no" : "yes")
+            << (h264.hardware ? " (hardware)" : "")
+            << " av1=" << (av1.names.empty() ? "no" : "yes")
+            << (av1.hardware ? " (hardware)" : "")
+            << " hls_demuxers=" << hls_demuxers.size() << std::endl;
+
+  // Write to a temp file, fsync, then rename, so a power cut mid-write never
+  // leaves a truncated file behind for the app to choke on.
+  const std::string tmp_path = std::string(kCodecCapabilitiesPath) + ".tmp";
+  FILE* fp = std::fopen(tmp_path.c_str(), "w");
+  if (!fp) {
+    std::cerr << "CODEC-CAPS: cannot write " << tmp_path << ": "
+              << std::strerror(errno) << std::endl;
+    return;
+  }
+  const bool written =
+      std::fwrite(json.data(), 1, json.size(), fp) == json.size() &&
+      std::fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+  std::fclose(fp);
+  if (!written || std::rename(tmp_path.c_str(), kCodecCapabilitiesPath) != 0) {
+    std::cerr << "CODEC-CAPS: failed to save " << kCodecCapabilitiesPath << ": "
+              << std::strerror(errno) << std::endl;
+    std::remove(tmp_path.c_str());
+    return;
+  }
+  std::cout << "CODEC-CAPS: saved " << kCodecCapabilitiesPath << std::endl;
+}
 }  // namespace
 
 GstVideoPlayer::GstVideoPlayer(
@@ -504,6 +749,7 @@ GstVideoPlayer::GstVideoPlayer(
         is_live_ = stream_type == "live";
         std::cout << "URI-STREAM-TYPE: explicit " << stream_type << std::endl;
       }
+      if (value_for("pipeline") == "playbin3") use_playbin3_ = true;
       const std::string offset_ms = value_for("offset_ms");
       if (!offset_ms.empty()) {
         try {
@@ -515,6 +761,10 @@ GstVideoPlayer::GstVideoPlayer(
       }
       uri_.resize(pos);
     }
+  }
+  const char* pipeline_env = std::getenv("SOATV_PIPELINE");
+  if (pipeline_env && std::strcmp(pipeline_env, "playbin3") == 0) {
+    use_playbin3_ = true;
   }
   // URI-based live hint. Defense-in-depth: hlsdemux is supposed to classify
   // the stream as live during Preroll (returns GST_STATE_CHANGE_NO_PREROLL),
@@ -580,6 +830,7 @@ GstVideoPlayer::~GstVideoPlayer() {
 void GstVideoPlayer::GstLibraryLoad() {
   InstallTimestampedLogging();
   gst_init(NULL, NULL);
+  WriteCodecCapabilities();
 }
 
 // static
@@ -1114,6 +1365,7 @@ void* GstVideoPlayer::GetEGLImage(void* egl_display, void* egl_context) {
   // blocking the entire UI (and delaying remote-driven overlays).
   std::shared_lock<std::shared_mutex> lock(mutex_buffer_, std::try_to_lock);
   if (!lock.owns_lock()) {
+    frame_lock_busy_.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
   }
   if (!gst_.buffer) {
@@ -1164,22 +1416,147 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
   // input and overlays responsive and the next decoded frame retries.
   std::shared_lock<std::shared_mutex> lock(mutex_buffer_, std::try_to_lock);
   if (!lock.owns_lock()) {
+    frame_lock_busy_.fetch_add(1, std::memory_order_relaxed);
+    if (frame_diag_enabled_.load(std::memory_order_relaxed)) {
+      LogFlash("kind=no_frame reason=frame_swap_in_progress");
+    }
     return nullptr;
   }
   if (!gst_.buffer) {
+    if (frame_diag_enabled_.load(std::memory_order_relaxed)) {
+      LogFlash("kind=no_frame reason=no_decoded_frame");
+    }
     return nullptr;
   }
 
   const uint32_t pixel_bytes = width_ * height_ * 4;
   gst_buffer_extract(gst_.buffer, 0, pixels_.get(), pixel_bytes);
+  if (frame_diag_enabled_.load(std::memory_order_relaxed)) {
+    ClassifyFrameForDiagnostics();
+  }
   return reinterpret_cast<const uint8_t*>(pixels_.get());
 #endif
+}
+
+// Raster thread, after the frame was copied into pixels_ (RGBA in memory).
+// 64 samples on an 8x8 grid: cheap next to the ~17 ms copy. A real fade to
+// black in the content also counts, so the FLASH start/end lines (a run of
+// one or two refreshes between normal frames) matter more than the counts.
+void GstVideoPlayer::ClassifyFrameForDiagnostics() {
+  if (width_ <= 0 || height_ <= 0 || !pixels_) return;
+  const auto* px = reinterpret_cast<const uint8_t*>(pixels_.get());
+  bool all_dark = true;
+  bool all_clear = true;
+  for (int gy = 0; gy < 8; ++gy) {
+    for (int gx = 0; gx < 8; ++gx) {
+      const size_t x = static_cast<size_t>((2 * gx + 1) * width_ / 16);
+      const size_t y = static_cast<size_t>((2 * gy + 1) * height_ / 16);
+      const uint8_t* p = px + (y * static_cast<size_t>(width_) + x) * 4;
+      if (p[0] >= 16 || p[1] >= 16 || p[2] >= 16) all_dark = false;
+      if (p[3] != 0) all_clear = false;
+    }
+  }
+  const int kind = all_clear ? 2 : (all_dark ? 1 : 0);
+  if (kind == 1) black_frames_.fetch_add(1, std::memory_order_relaxed);
+  if (kind == 2) transparent_frames_.fetch_add(1, std::memory_order_relaxed);
+
+  static const char* const kKindNames[] = {"normal", "black", "transparent"};
+  if (kind != bad_frame_kind_) {
+    if (bad_frame_kind_ != 0) {
+      LogFlash(std::string("kind=") + kKindNames[bad_frame_kind_] +
+               " ended after " + std::to_string(bad_frame_run_) +
+               " refreshes");
+    }
+    if (kind != 0) {
+      LogFlash(std::string("kind=") + kKindNames[kind] +
+               " started frame=" +
+               std::to_string(
+                   frames_handed_off_.load(std::memory_order_relaxed)));
+    }
+    bad_frame_kind_ = kind;
+    bad_frame_run_ = 0;
+  }
+  if (kind != 0) ++bad_frame_run_;
+}
+
+// Raster thread only. At most 5 FLASH lines per second so a burst can't
+// flood the log; the next printed line reports how many were dropped.
+void GstVideoPlayer::LogFlash(const std::string& detail) {
+  const int64_t now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now()
+                                  .time_since_epoch())
+                              .count();
+  if (now_sec != flash_window_sec_) {
+    flash_window_sec_ = now_sec;
+    flash_lines_in_window_ = 0;
+  }
+  if (++flash_lines_in_window_ > 5) {
+    ++flash_suppressed_;
+    return;
+  }
+  std::cout << "FLASH: " << detail;
+  if (flash_suppressed_ > 0) {
+    std::cout << " (suppressed " << flash_suppressed_ << " earlier)";
+    flash_suppressed_ = 0;
+  }
+  std::cout << std::endl;
+}
+
+// static
+void GstVideoPlayer::LogSocState() {
+  std::string temp = "unavailable";
+  std::ifstream tf("/sys/class/thermal/thermal_zone0/temp");
+  int millideg = 0;
+  if (tf >> millideg) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%.1fC", millideg / 1000.0);
+    temp = buf;
+  }
+  std::string mhz = "unavailable";
+  std::ifstream ff("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq");
+  long khz = 0;
+  if (ff >> khz) mhz = std::to_string(khz / 1000);
+  // throttled=0x0 means no undervoltage, frequency cap or thermal throttle
+  // now or since boot. vcgencmd may be missing on minimal images.
+  std::string throttled = "unavailable";
+  if (FILE* fp = popen("vcgencmd get_throttled 2>/dev/null", "r")) {
+    char line[64];
+    if (fgets(line, sizeof(line), fp)) {
+      std::string s(line);
+      if (!s.empty() && s.back() == '\n') s.pop_back();
+      const auto eq = s.find('=');
+      throttled = eq == std::string::npos ? s : s.substr(eq + 1);
+    }
+    pclose(fp);
+  }
+  std::cout << "SOC: temp=" << temp << " cpu_mhz=" << mhz
+            << " throttled=" << throttled << std::endl;
 }
 
 // Pick an ALSA device for audio output by detecting which HDMI connector is
 // physically connected via DRM, then mapping back to the matching ALSA card.
 // DRM connector "HDMI-A-N" pairs with ALSA card id "vc4hdmi{N-1}".
 // Falls back to plughw:0,0 (3.5mm jack on Pi) if no HDMI is connected.
+// hdmi_force_hotplug=1 / video=HDMI-A-1:...D make the connector report
+// "connected" even with no display attached. The vc4 HDMI audio driver then
+// has no EDID, decides the sink can't play audio and fails the PCM open with
+// ENOTSUPP (524). Only a non-empty EDID proves a real display is attached.
+static bool HdmiHasEdid(int hdmi_idx) {
+  char pattern[64];
+  std::snprintf(pattern, sizeof(pattern), "/sys/class/drm/card*-HDMI-A-%d/edid",
+                hdmi_idx);
+  glob_t g{};
+  bool has_edid = false;
+  if (glob(pattern, 0, nullptr, &g) == 0) {
+    for (size_t i = 0; i < g.gl_pathc && !has_edid; ++i) {
+      std::ifstream f(g.gl_pathv[i], std::ios::binary);
+      has_edid = f && f.get() != std::char_traits<char>::eof();
+    }
+  }
+  globfree(&g);
+  return has_edid;
+}
+
 static std::string PickAudioDevice() {
   for (int hdmi_idx = 1; hdmi_idx <= 4; ++hdmi_idx) {
     char pattern[64];
@@ -1201,6 +1578,13 @@ static std::string PickAudioDevice() {
     }
     globfree(&g);
     if (!connected) continue;
+    if (!HdmiHasEdid(hdmi_idx)) {
+      std::cout << "PickAudioDevice: HDMI-A-" << hdmi_idx
+                << " reports connected but has no EDID (forced hotplug, no "
+                   "display) — skipping HDMI audio"
+                << std::endl;
+      continue;
+    }
 
     char target[16];
     std::snprintf(target, sizeof(target), "vc4hdmi%d", hdmi_idx - 1);
@@ -1421,11 +1805,20 @@ bool GstVideoPlayer::CreatePipeline() {
     return false;
   }
 
-  gst_.playbin = gst_element_factory_make("playbin", "playbin");
+  gst_.playbin = gst_element_factory_make(
+      use_playbin3_ ? "playbin3" : "playbin", "playbin");
+  if (!gst_.playbin && use_playbin3_) {
+    std::cerr << "PIPELINE: playbin3 unavailable, falling back to playbin"
+              << std::endl;
+    use_playbin3_ = false;
+    gst_.playbin = gst_element_factory_make("playbin", "playbin");
+  }
   if (!gst_.playbin) {
     std::cerr << "Failed to create playbin" << std::endl;
     return false;
   }
+  std::cout << "PIPELINE: using " << (use_playbin3_ ? "playbin3" : "playbin")
+            << std::endl;
 
   g_signal_connect(gst_.playbin, "source-setup",
                    G_CALLBACK(SourceSetupCallback), this);
@@ -1641,6 +2034,7 @@ bool GstVideoPlayer::CreatePipeline() {
               << "kbps (instead of default " << kColdStartConnSpeedKbps
               << "kbps)" << std::endl;
   }
+  startup_conn_kbps_ = cold_start_kbps;
   g_object_set(gst_.playbin, "buffer-size", (gint)10485760,  // 10 MiB
                "buffer-duration", kBufferTargetNs,           // 60 s (task #60)
                "connection-speed", cold_start_kbps, NULL);
@@ -1707,35 +2101,89 @@ bool GstVideoPlayer::CreatePipeline() {
 }
 
 bool GstVideoPlayer::Preroll() {
-  // plughw is commonly exclusive on embedded images. If a rapid reconnect
-  // collides with the previous pipeline (or another audio client), retry once
-  // with a silent sink so an audio collision does not kill video playback.
-  for (int attempt = 0; attempt < 2; ++attempt) {
+  // plughw is exclusive on the box. When another player (the outgoing live
+  // mini player, radio/podcast via audioplayers) still holds it, it is usually
+  // released within a second or two — wait for it with backoff instead of
+  // dropping audio. Only if it stays busy, fall back to a silent sink so the
+  // collision does not kill video playback.
+  static constexpr int kAlsaBusyRetryDelaysMs[] = {250, 500, 750, 1000};
+  constexpr int kAlsaBusyRetries =
+      sizeof(kAlsaBusyRetryDelaysMs) / sizeof(kAlsaBusyRetryDelaysMs[0]);
+  int busy_retries = 0;
+  struct PrerollFlag {
+    std::atomic<bool>& flag;
+    explicit PrerollFlag(std::atomic<bool>& f) : flag(f) { flag.store(true); }
+    ~PrerollFlag() { flag.store(false); }
+  } preroll_flag(in_preroll_);
+  while (true) {
     audio_device_busy_.store(false);
+    audio_device_unsupported_.store(false);
     auto result = gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
-    const bool busy = audio_device_busy_.load();
-    if (result == GST_STATE_CHANGE_FAILURE || busy) {
-      if (busy && !audio_disabled_ && attempt == 0 && DisableAudioSink()) {
-        std::cerr << "Preroll: ALSA device busy; retrying video without audio"
+    if (result != GST_STATE_CHANGE_FAILURE && !audio_device_busy_.load()) {
+      // NO_PREROLL (live source) and ASYNC are both acceptable — not errors.
+      // NO_PREROLL is GStreamer's authoritative "this source is LIVE" signal.
+      // The ALSA open usually fails during this wait (playsink opens alsasink
+      // from a streaming thread) and the async change then never completes,
+      // so wait in short slices and stop as soon as the bus reports busy or an
+      // error. A single 5 s wait per attempt made 4 retries cost ~27 s, all of
+      // it blocking a dispose() that joins this thread.
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!audio_device_busy_.load() && !error_notified_.load() &&
+             std::chrono::steady_clock::now() < deadline) {
+        GstState state;
+        if (gst_element_get_state(gst_.pipeline, &state, NULL,
+                                  100 * GST_MSECOND) !=
+            GST_STATE_CHANGE_ASYNC) {
+          break;
+        }
+      }
+    }
+    if (audio_device_busy_.load() && error_notified_.load()) {
+      // Another error already reached Dart, which is reconnecting. Retrying
+      // here would only hold the device while the new player starts, and
+      // Init() fails on error_notified_ regardless.
+      std::cerr << "Preroll: ALSA device busy after an error was reported; "
+                   "not retrying"
+                << std::endl;
+      return false;
+    }
+    if (audio_device_busy_.load()) {
+      const bool unsupported = audio_device_unsupported_.load();
+      if (!audio_disabled_ && !unsupported &&
+          busy_retries < kAlsaBusyRetries) {
+        const int delay_ms = kAlsaBusyRetryDelaysMs[busy_retries++];
+        std::cerr << "Preroll: ALSA device busy; retry " << busy_retries << "/"
+                  << kAlsaBusyRetries << " in " << delay_ms << "ms"
                   << std::endl;
+        // NULL closes our half-opened alsasink before the next attempt.
+        gst_element_set_state(gst_.pipeline, GST_STATE_NULL);
+        gst_element_get_state(gst_.pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         continue;
       }
+      if (!audio_disabled_ && DisableAudioSink()) {
+        if (unsupported) {
+          std::cerr << "Preroll: HDMI audio not supported by the attached "
+                       "display (ENOTSUPP); continuing video without audio"
+                    << std::endl;
+        } else {
+          std::cerr << "Preroll: ALSA device still busy after "
+                    << busy_retries
+                    << " retries; continuing video without audio" << std::endl;
+        }
+        continue;
+      }
+      return false;
+    }
+    if (result == GST_STATE_CHANGE_FAILURE) {
       std::cerr << "Preroll: Failed to change state to PAUSED" << std::endl;
       return false;
     }
-
-    // NO_PREROLL (live source) and ASYNC are both acceptable — not errors.
-    // NO_PREROLL is GStreamer's authoritative "this source is LIVE" signal.
-    GstState state;
-    gst_element_get_state(gst_.pipeline, &state, NULL, 5 * GST_SECOND);
-    if (audio_device_busy_.load() && !audio_disabled_ && attempt == 0 &&
-        DisableAudioSink()) {
-      std::cerr << "Preroll: ALSA device became busy; retrying video without "
-                   "audio"
-                << std::endl;
-      continue;
+    if (busy_retries > 0) {
+      std::cout << "Preroll: ALSA device opened after " << busy_retries
+                << " retries" << std::endl;
     }
-    if (audio_device_busy_.load()) return false;
 
     if (result == GST_STATE_CHANGE_NO_PREROLL && !stream_type_is_explicit_) {
       is_live_ = true;
@@ -1749,7 +2197,6 @@ bool GstVideoPlayer::Preroll() {
     }
     return true;
   }
-  return false;
 }
 
 bool GstVideoPlayer::DisableAudioSink() {
@@ -1772,6 +2219,12 @@ bool GstVideoPlayer::DisableAudioSink() {
   audio_disabled_ = true;
   audio_device_busy_.store(false);
   return true;
+}
+
+void GstVideoPlayer::ReleasePipeline() {
+  std::cout << "DISPOSE: releasing pipeline (audio device, decoder)"
+            << std::endl;
+  DestroyPipeline();
 }
 
 void GstVideoPlayer::DestroyPipeline() {
@@ -1910,16 +2363,48 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   gst_structure_get_int(structure, "height", &height);
   gst_caps_unref(caps);
 
+  // TEXTURE_DIAG only: time the exclusive section below. Measurement only —
+  // the locking and the order of operations are unchanged.
+  const bool timed = self->frame_diag_enabled_.load(std::memory_order_relaxed);
+  std::chrono::steady_clock::time_point wait_started, locked_at, unref_started,
+      unref_done, unlocking_at;
+  if (timed) wait_started = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::shared_mutex> lock(self->mutex_buffer_);
+    if (timed) locked_at = std::chrono::steady_clock::now();
     if (width != self->width_ || height != self->height_) {
       self->width_ = width;
       self->height_ = height;
       if (width > 0 && height > 0)
         self->pixels_.reset(new uint32_t[width * height]);
     }
+    if (timed) unref_started = std::chrono::steady_clock::now();
     if (self->gst_.buffer) gst_buffer_unref(self->gst_.buffer);
+    if (timed) unref_done = std::chrono::steady_clock::now();
     self->gst_.buffer = gst_buffer_ref(buf);
+    if (timed) unlocking_at = std::chrono::steady_clock::now();
+  }
+  if (timed) {
+    auto ns = [](std::chrono::steady_clock::duration d) {
+      return static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+    };
+    // Single writer (the streaming thread); the TEXTURE_DIAG thread only
+    // exchanges these to 0, so a racing reset can at worst drop one sample.
+    auto record_max = [](std::atomic<uint64_t>& maximum, uint64_t value) {
+      if (value > maximum.load(std::memory_order_relaxed))
+        maximum.store(value, std::memory_order_relaxed);
+    };
+    const uint64_t wait_ns = ns(locked_at - wait_started);
+    const uint64_t hold_ns = ns(unlocking_at - locked_at);
+    const uint64_t unref_ns = ns(unref_done - unref_started);
+    self->handoff_lock_samples_.fetch_add(1, std::memory_order_relaxed);
+    self->handoff_wait_ns_.fetch_add(wait_ns, std::memory_order_relaxed);
+    self->handoff_hold_ns_.fetch_add(hold_ns, std::memory_order_relaxed);
+    self->handoff_unref_ns_.fetch_add(unref_ns, std::memory_order_relaxed);
+    record_max(self->handoff_wait_max_ns_, wait_ns);
+    record_max(self->handoff_hold_max_ns_, hold_ns);
+    record_max(self->handoff_unref_max_ns_, unref_ns);
   }
 
   // Wake Init()'s condition variable on the very first frame. Also engage
@@ -2114,12 +2599,12 @@ void GstVideoPlayer::LogPlaybackHealth(
       if (hls_demux_) demux = GST_ELEMENT(gst_object_ref(hls_demux_));
     }
     if (demux) {
-      guint64 current_bitrate = 0;
-      GObjectClass* klass = G_OBJECT_GET_CLASS(demux);
-      if (g_object_class_find_property(klass, "current-bitrate")) {
-        g_object_get(demux, "current-bitrate", &current_bitrate, NULL);
-        std::cout << "BUFFER-COLLAPSE: hlsdemux current-bitrate="
-                  << current_bitrate << std::endl;
+      for (const char* prop : {"current-bitrate", "current-bandwidth"}) {
+        double value = 0.0;
+        if (GetNumericProperty(demux, prop, &value)) {
+          std::cout << "BUFFER-COLLAPSE: hlsdemux " << prop << "="
+                    << static_cast<guint64>(value) << std::endl;
+        }
       }
       gst_object_unref(demux);
     }
@@ -2472,28 +2957,6 @@ void GstVideoPlayer::StopWatchdog() {
 //               so switches never interrupt playback
 // ============================================================
 
-namespace {
-// connection-speed is guint (kbps) on adaptivedemux-based hlsdemux but
-// guint64 on playbin — set it through GValue so the type always matches.
-void SetConnectionSpeedKbps(GstElement* element, guint64 kbps) {
-  GParamSpec* pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(element),
-                                                   "connection-speed");
-  if (!pspec) return;
-  GValue v = G_VALUE_INIT;
-  g_value_init(&v, pspec->value_type);
-  if (pspec->value_type == G_TYPE_UINT) {
-    g_value_set_uint(&v, static_cast<guint>(kbps));
-  } else if (pspec->value_type == G_TYPE_UINT64) {
-    g_value_set_uint64(&v, kbps);
-  } else {
-    g_value_unset(&v);
-    return;
-  }
-  g_object_set_property(G_OBJECT(element), "connection-speed", &v);
-  g_value_unset(&v);
-}
-}  // namespace
-
 // static
 void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
                                              GstBin* /*sub_bin*/,
@@ -2527,12 +2990,28 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
     // boundaries. Does NOT disable hlsdemux's own per-segment ABR
     // measurements — it still picks the min of (its own estimate,
     // connection-speed). This is a small alignment tuning, not a hard lock.
-    GObjectClass* klass = G_OBJECT_GET_CLASS(element);
-    if (g_object_class_find_property(klass, "bitrate-limit")) {
-      g_object_set(element, "bitrate-limit", 1.0f, NULL);
-      std::cout
-          << "ABR: set hlsdemux bitrate-limit=1.0 (removes default 0.8 shave)"
-          << std::endl;
+    GstElementFactory* factory = gst_element_get_factory(element);
+    if (factory && g_strcmp0(gst_plugin_feature_get_name(
+                                 GST_PLUGIN_FEATURE(factory)),
+                             "hlsdemux2") == 0) {
+      self->ConfigureAdaptiveDemux2(element);
+    } else {
+      // Legacy playbin's decodebin autoplugs hlsdemux2 first (rank primary+1),
+      // discards it, then falls back to hlsdemux (device log 2026-11-02:
+      // hlsdemux2-0 then hlsdemux0 within 5 ms). hls_demux_ now points at the
+      // legacy demuxer, so drop the hlsdemux2 mode or ABR would poll a
+      // property it lacks and ignore the http-source samples it still needs.
+      if (self->adaptive_demux2_.exchange(false)) {
+        std::cout << "ABR: hlsdemux2 was replaced by " << name
+                  << " — using legacy demuxer handling" << std::endl;
+      }
+      GObjectClass* klass = G_OBJECT_GET_CLASS(element);
+      if (g_object_class_find_property(klass, "bitrate-limit")) {
+        g_object_set(element, "bitrate-limit", 1.0f, NULL);
+        std::cout
+            << "ABR: set hlsdemux bitrate-limit=1.0 (removes default 0.8 shave)"
+            << std::endl;
+      }
     }
   } else if (name && (g_str_has_prefix(name, "decodebin") ||
                       g_str_has_prefix(name, "uridecodebin"))) {
@@ -2561,6 +3040,14 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
       std::cout << "ABR: attached throughput probe to source: " << name
                 << std::endl;
     }
+  } else if (name && g_str_has_prefix(name, "multiqueue") &&
+             self->use_playbin3_) {
+    // playbin3 sizes its own buffering from buffer-duration/buffer-size
+    // (legacy hlsdemux) or leaves it to hlsdemux2, and decodebin3's
+    // multiqueue sits after that buffering — widening it would only move
+    // data out of the measured buffer.
+    std::cout << "MULTIQUEUE: playbin3 — leaving " << name << " at defaults"
+              << std::endl;
   } else if (name && g_str_has_prefix(name, "multiqueue")) {
     // hlsdemux's downstream multiqueue defaults to max-size-buffers=5,
     // max-size-bytes=2MB, max-size-time=2s — a much smaller window than
@@ -2720,7 +3207,9 @@ void GstVideoPlayer::CloseBurstLocked() {
                           .count();
   // Skip playlist refreshes and degenerate timings — only segment-sized
   // transfers measured over a meaningful window are useful samples.
-  if (burst_bytes_ >= 64 * 1024 && secs > 0.05) {
+  // With hlsdemux2 the http source only carries playlists; samples come from
+  // PollAdaptiveDemuxBandwidth() instead.
+  if (!adaptive_demux2_.load() && burst_bytes_ >= 64 * 1024 && secs > 0.05) {
     const double throughput_bps =
         static_cast<double>(burst_bytes_) * 8.0 / secs;
     last_segment_bytes_ = burst_bytes_;
@@ -2769,7 +3258,113 @@ void GstVideoPlayer::StopAbrEngine() {
   }
 }
 
+// adaptivedemux2 (hlsdemux2) setup. Our ABR engine stays in charge: it keeps
+// steering through connection-bitrate exactly as it steers legacy hlsdemux
+// through connection-speed, so the ABR_RESTART protection for live
+// down-switches (bcm2835 S_FMT) is unchanged.
+void GstVideoPlayer::ConfigureAdaptiveDemux2(GstElement* demux) {
+  adaptive_demux2_.store(true);
+  std::cout << "ABR: hlsdemux2 (adaptivedemux2) detected" << std::endl;
+
+  // Same reasoning as legacy bitrate-limit=1.0 (task #50): our published rate
+  // is already safety-shaved, don't let the demuxer shave it again.
+  if (SetNumericProperty(demux, "bandwidth-target-ratio", 1.0)) {
+    std::cout << "ABR: set hlsdemux2 bandwidth-target-ratio=1.0" << std::endl;
+  }
+  // playbin forwards its connection-speed to legacy hlsdemux; hlsdemux2 gets
+  // the cold-start rung directly.
+  if (startup_conn_kbps_ > 0) {
+    SetConnectionSpeedKbps(demux, startup_conn_kbps_);
+    std::cout << "STARTUP-RUNG: hlsdemux2 connection rate "
+              << startup_conn_kbps_ << "kbps" << std::endl;
+  }
+  // hlsdemux2 buffers internally and posts the BUFFERING messages itself.
+  // Put the high watermark at our buffering target so percent keeps meaning
+  // "percent of kBufferTargetSecs", which AbrTick's buffer zones assume.
+  SetNumericProperty(demux, "max-buffering-time",
+                     static_cast<double>(kBufferTargetNs));
+  SetNumericProperty(demux, "high-watermark-time",
+                     static_cast<double>(kBufferTargetNs));
+  for (const char* prop :
+       {"max-buffering-time", "high-watermark-time",
+        "low-watermark-time"}) {
+    double value = 0.0;
+    if (GetNumericProperty(demux, prop, &value)) {
+      std::cout << "BUFFERING: hlsdemux2 " << prop << "="
+                << static_cast<guint64>(value / GST_MSECOND) << "ms"
+                << std::endl;
+    } else {
+      std::cout << "BUFFERING: hlsdemux2 has no " << prop << std::endl;
+    }
+  }
+
+  g_signal_connect(demux, "pad-added", G_CALLBACK(AdaptiveDemuxPadAdded),
+                   this);
+}
+
+// static
+void GstVideoPlayer::AdaptiveDemuxPadAdded(GstElement* /*demux*/, GstPad* pad,
+                                           gpointer user_data) {
+  if (GST_PAD_DIRECTION(pad) != GST_PAD_SRC) return;
+  gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, AdaptiveDemuxOutputProbe,
+                    user_data, NULL);
+}
+
+// Preroll progress for hlsdemux2: bytes leaving the demuxer stand in for the
+// bytes the http source pad used to see. Before the first frame nothing
+// downstream is full yet, so output keeps pace with downloads.
+// static
+GstPadProbeReturn GstVideoPlayer::AdaptiveDemuxOutputProbe(
+    GstPad* /*pad*/, GstPadProbeInfo* info, gpointer user_data) {
+  auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (!buf) return GST_PAD_PROBE_OK;
+  const gsize size = gst_buffer_get_size(buf);
+  if (!self->first_network_chunk_logged_.exchange(true)) {
+    self->LogPlaybackStartup("first_hls_network_chunk",
+                             "bytes=" + std::to_string(size));
+  }
+  self->total_bytes_fetched_.fetch_add(size, std::memory_order_relaxed);
+  return GST_PAD_PROBE_OK;
+}
+
+// Throughput samples for hlsdemux2. It measures each segment download itself
+// and exposes the result as current-bandwidth (bits/sec); a new value means a
+// new segment finished, which is what one http-source burst meant before.
+void GstVideoPlayer::PollAdaptiveDemuxBandwidth() {
+  GstElement* demux = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(abr_mutex_);
+    if (hls_demux_) demux = GST_ELEMENT(gst_object_ref(hls_demux_));
+  }
+  if (!demux) return;
+  double bandwidth_bps = 0.0;
+  const bool ok = GetNumericProperty(demux, "current-bandwidth", &bandwidth_bps);
+  gst_object_unref(demux);
+  if (!ok) {
+    static std::atomic<bool> missing_logged{false};
+    if (!missing_logged.exchange(true)) {
+      std::cerr << "ABR: hlsdemux2 has no current-bandwidth — no throughput "
+                   "samples, demuxer stays on the cold-start rate"
+                << std::endl;
+    }
+    return;
+  }
+  const auto bps = static_cast<guint64>(bandwidth_bps);
+  if (bps == 0 || bps == last_demux2_bandwidth_bps_) return;
+  last_demux2_bandwidth_bps_ = bps;
+
+  std::lock_guard<std::mutex> lock(abr_mutex_);
+  abr_samples_.push_back(bandwidth_bps);
+  while (abr_samples_.size() > 16) abr_samples_.pop_front();
+  last_segment_throughput_bps_ = bandwidth_bps;
+  std::cout << "NETWORK: hlsdemux2 current-bandwidth = "
+            << static_cast<int>(bandwidth_bps / 1000.0) << " kbps"
+            << std::endl;
+}
+
 void GstVideoPlayer::AbrTick() {
+  if (adaptive_demux2_.load()) PollAdaptiveDemuxBandwidth();
   std::deque<double> samples;
   GstElement* demux = nullptr;
   {
@@ -3389,7 +3984,22 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       // this to Dart immediately would trigger a reconnect before the native
       // silent-audio fallback can retry the same pipeline.
       if (IsAlsaDeviceBusy(error, debug)) {
+        if (IsAlsaDeviceUnsupported(error, debug)) {
+          self->audio_device_unsupported_.store(true);
+        }
         self->audio_device_busy_.store(true);
+        g_free(debug);
+        g_error_free(error);
+        break;
+      }
+      // Same failure, reported again by playsink under playbin3 ("Configured
+      // audiosink audio_bin is not working"). Forwarding it made Dart
+      // reconnect instead of letting Preroll() retry or fall back to silence.
+      if (self->in_preroll_.load() && self->audio_device_busy_.load() &&
+          IsAudioSinkNotWorking(error)) {
+        std::cerr << "Preroll: playsink follow-up to the ALSA open failure "
+                     "handled natively"
+                  << std::endl;
         g_free(debug);
         g_error_free(error);
         break;
