@@ -246,6 +246,10 @@ class GstVideoPlayer {
   // so existing launchers keep working. CreatePipeline() falls back to playbin
   // if playbin3 can't be created.
   bool use_playbin3_ = true;
+  // ABR rendition switching. Off by default (kAbrSwitchingDefault): the stream
+  // stays pinned at 720p and the ABR engine only logs what it would do.
+  // SOATV_ABR=on turns switching back on for the whole process.
+  bool abr_switching_enabled_ = false;
   // Cold-start connection speed chosen in CreatePipeline(). playbin forwards
   // it to legacy hlsdemux itself; hlsdemux2 gets it in ConfigureAdaptiveDemux2.
   guint64 startup_conn_kbps_ = 0;

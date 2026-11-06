@@ -320,6 +320,26 @@ constexpr double kUpSwitchMaxCv = 0.60;
 // preferable to never-starting; the root fix is on a separate branch.
 constexpr guint64 kColdStartConnSpeedKbps = 1500;
 
+// ABR switching kill-switch (2026-11-06). With switching off (the default) the
+// stream is pinned to one 720p rendition for its whole life: the demuxer gets
+// a fixed connection rate once at startup and the ABR engine never changes it
+// and never emits ABR_RESTART. The engine still measures and logs what it
+// WOULD have done ("ABR[observe-only]"), so its decisions can be studied
+// against real playback without acting on them. SOATV_ABR=on turns switching
+// back on for the whole process.
+//
+// The pin works by rate because neither demuxer selects renditions by
+// resolution: both pick the highest variant whose BANDWIDTH fits the
+// connection rate and fall back to the lowest variant when none fits. 6000
+// kbps covers this project's 720p renditions (device logs 2026-11-04 decoded
+// 1280x720 at every rate from 1500 to 6300 kbps) while staying under a typical
+// 1080p rung. hlsdemux2 additionally gets max-video-width/height when its
+// build has them, which makes the 720p ceiling exact.
+constexpr bool kAbrSwitchingDefault = false;
+constexpr guint64 kPinnedConnSpeedKbps = 6000;
+constexpr int kPinnedMaxVideoWidth = 1280;
+constexpr int kPinnedMaxVideoHeight = 720;
+
 // Startup readiness is based on a decoded video frame, not a buffering
 // percentage. A live playbin queue can reach 100% while the decoder or video
 // sink is still unable to deliver a frame, so keep startup bounded by a real
@@ -781,6 +801,24 @@ GstVideoPlayer::GstVideoPlayer(
     apply_pipeline_choice(pipeline_env, "SOATV_PIPELINE");
   }
   apply_pipeline_choice(pipeline_hint, "#soatv:pipeline");
+  abr_switching_enabled_ = kAbrSwitchingDefault;
+  if (const char* abr_env = std::getenv("SOATV_ABR")) {
+    const std::string value = abr_env;
+    if (value == "on" || value == "1") {
+      abr_switching_enabled_ = true;
+    } else if (value == "off" || value == "0") {
+      abr_switching_enabled_ = false;
+    } else {
+      std::cerr << "ABR: ignoring unknown SOATV_ABR value '" << value
+                << "' (expected on or off)" << std::endl;
+    }
+  }
+  if (!abr_switching_enabled_) {
+    std::cout << "ABR: switching OFF — rendition pinned at "
+              << kPinnedConnSpeedKbps << "kbps / max " << kPinnedMaxVideoWidth
+              << "x" << kPinnedMaxVideoHeight << " (SOATV_ABR=on re-enables)"
+              << std::endl;
+  }
   // URI-based live hint. Defense-in-depth: hlsdemux is supposed to classify
   // the stream as live during Preroll (returns GST_STATE_CHANGE_NO_PREROLL),
   // which flips is_live_=true there. But that only fires when the media
@@ -2058,9 +2096,20 @@ bool GstVideoPlayer::CreatePipeline() {
   // the fixed default. Task #48 (2026-08-20) added the auth-probe path
   // so cold-starts now match the actual network instead of always
   // starting at 1500 kbps.
-  const guint64 cold_start_kbps =
+  guint64 cold_start_kbps =
       startup_kbps_hint_ > 0 ? startup_kbps_hint_ : kColdStartConnSpeedKbps;
-  if (startup_kbps_hint_ > 0) {
+  if (!abr_switching_enabled_) {
+    // Pinned: one rendition for the stream's whole life, so the app's
+    // startup hint (auth-probe throughput or an old ABR_RESTART rung) can't
+    // move it.
+    cold_start_kbps = kPinnedConnSpeedKbps;
+    std::cout << "STARTUP-RUNG: pinned " << kPinnedConnSpeedKbps << "kbps"
+              << (startup_kbps_hint_ > 0
+                      ? " (ignoring soatv hint " +
+                            std::to_string(startup_kbps_hint_) + "kbps)"
+                      : std::string())
+              << std::endl;
+  } else if (startup_kbps_hint_ > 0) {
     std::cout << "STARTUP-RUNG: honoring soatv hint " << startup_kbps_hint_
               << "kbps (instead of default " << kColdStartConnSpeedKbps
               << "kbps)" << std::endl;
@@ -3314,6 +3363,20 @@ void GstVideoPlayer::ConfigureAdaptiveDemux2(GstElement* demux) {
     std::cout << "STARTUP-RUNG: hlsdemux2 connection rate "
               << startup_conn_kbps_ << "kbps" << std::endl;
   }
+  if (!abr_switching_enabled_) {
+    const bool width_ok = SetNumericProperty(demux, "max-video-width",
+                                             kPinnedMaxVideoWidth);
+    const bool height_ok = SetNumericProperty(demux, "max-video-height",
+                                              kPinnedMaxVideoHeight);
+    if (width_ok && height_ok) {
+      std::cout << "STARTUP-RUNG: hlsdemux2 max-video " << kPinnedMaxVideoWidth
+                << "x" << kPinnedMaxVideoHeight << std::endl;
+    } else {
+      std::cout << "STARTUP-RUNG: hlsdemux2 has no max-video-width/height — "
+                   "720p pin relies on the connection rate alone"
+                << std::endl;
+    }
+  }
   // hlsdemux2 buffers internally and posts the BUFFERING messages itself.
   // Put the high watermark at our buffering target so percent keeps meaning
   // "percent of kBufferTargetSecs", which AbrTick's buffer zones assume.
@@ -3799,6 +3862,29 @@ void GstVideoPlayer::AbrTick() {
     // (proper snapshot + position preservation), this gate can be
     // relaxed.
     const bool allow_abr_restart = is_live_;
+
+    if (!abr_switching_enabled_) {
+      // Observe-only: record the decision and how it would have been applied,
+      // but leave the demuxer on its pinned rate. published_kbps_ above is now
+      // the shadow rate, so later ticks keep reasoning from this decision.
+      const bool would_restart =
+          allow_abr_restart &&
+          (is_down_switch || (is_up_switch && up_is_fragile));
+      std::cout << "ABR[observe-only]: would "
+                << (is_down_switch ? "down-switch"
+                                   : is_up_switch ? "up-switch" : "set rate")
+                << " to " << target_kbps << "kbps via "
+                << (would_restart ? "ABR_RESTART" : "in-place") << " ("
+                << reason
+                << (up_is_fragile ? ", fragile: " + fragile_reason
+                                  : std::string())
+                << ", predicted=" << static_cast<int>(predicted_bps / 1000)
+                << "kbps cv=" << static_cast<int>(cv * 100)
+                << "% buffer=" << static_cast<int>(buffer_secs) << "s)"
+                << std::endl;
+      gst_object_unref(demux);
+      return;
+    }
 
     if (is_down_switch && allow_abr_restart) {
       std::string msg =
