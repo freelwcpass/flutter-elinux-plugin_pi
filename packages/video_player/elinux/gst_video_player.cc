@@ -717,6 +717,7 @@ GstVideoPlayer::GstVideoPlayer(
   // Parse manually rather than pulling in a full URI library — the
   // fragment format is stable and simple, and this runs exactly once per
   // player construction.
+  std::string pipeline_hint;  // from the fragment; applied after SOATV_PIPELINE
   {
     const std::string kMarker = "#soatv:";
     const auto pos = uri_.find(kMarker);
@@ -749,7 +750,7 @@ GstVideoPlayer::GstVideoPlayer(
         is_live_ = stream_type == "live";
         std::cout << "URI-STREAM-TYPE: explicit " << stream_type << std::endl;
       }
-      if (value_for("pipeline") == "playbin3") use_playbin3_ = true;
+      pipeline_hint = value_for("pipeline");
       const std::string offset_ms = value_for("offset_ms");
       if (!offset_ms.empty()) {
         try {
@@ -762,10 +763,24 @@ GstVideoPlayer::GstVideoPlayer(
       uri_.resize(pos);
     }
   }
-  const char* pipeline_env = std::getenv("SOATV_PIPELINE");
-  if (pipeline_env && std::strcmp(pipeline_env, "playbin3") == 0) {
-    use_playbin3_ = true;
+  // playbin3 by default; SOATV_PIPELINE (box-wide) then the URI fragment (per
+  // stream) can switch between "playbin" and "playbin3". Anything else is
+  // ignored so a typo can't silently change the pipeline.
+  const auto apply_pipeline_choice = [this](const std::string& value,
+                                            const char* source) {
+    if (value == "playbin3") {
+      use_playbin3_ = true;
+    } else if (value == "playbin") {
+      use_playbin3_ = false;
+    } else if (!value.empty()) {
+      std::cerr << "PIPELINE: ignoring unknown " << source << " value '"
+                << value << "' (expected playbin or playbin3)" << std::endl;
+    }
+  };
+  if (const char* pipeline_env = std::getenv("SOATV_PIPELINE")) {
+    apply_pipeline_choice(pipeline_env, "SOATV_PIPELINE");
   }
+  apply_pipeline_choice(pipeline_hint, "#soatv:pipeline");
   // URI-based live hint. Defense-in-depth: hlsdemux is supposed to classify
   // the stream as live during Preroll (returns GST_STATE_CHANGE_NO_PREROLL),
   // which flips is_live_=true there. But that only fires when the media
