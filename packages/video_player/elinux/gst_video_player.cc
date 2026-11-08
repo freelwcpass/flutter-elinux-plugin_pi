@@ -2108,6 +2108,11 @@ bool GstVideoPlayer::CreatePipeline() {
       g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
       audio_volume_ =
           volume;  // ref held via bin ownership; cleared in DestroyPipeline
+      // The audio bin is recreated on pipeline teardown/rebuild. Restore the
+      // player-level volume preference on both playbin and the custom volume
+      // element instead of silently reverting to GStreamer's 1.0 default.
+      g_object_set(gst_.playbin, "volume", volume_, NULL);
+      g_object_set(audio_volume_, "volume", volume_, NULL);
     }
   }
 
