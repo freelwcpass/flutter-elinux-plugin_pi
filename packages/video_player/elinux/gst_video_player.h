@@ -239,11 +239,17 @@ class GstVideoPlayer {
   // selects the cold-start rung; trace and offset_ms join native diagnostics
   // to the app-side startup timeline. The fragment is stripped before playbin.
   guint64 startup_kbps_hint_ = 0;
-  // Pipeline selection. playbin3 is opted into per stream with the
-  // `#soatv:pipeline=playbin3` URI fragment or for the whole process with
-  // SOATV_PIPELINE=playbin3; otherwise the legacy playbin path is unchanged.
-  // CreatePipeline() falls back to playbin if playbin3 can't be created.
-  bool use_playbin3_ = false;
+  // Pipeline selection. playbin3 (with hlsdemux2) is the default. Legacy
+  // playbin can be forced for the whole process with SOATV_PIPELINE=playbin,
+  // or per stream with the `#soatv:pipeline=playbin` URI fragment; the
+  // fragment wins over the environment. `playbin3` is accepted in both places
+  // so existing launchers keep working. CreatePipeline() falls back to playbin
+  // if playbin3 can't be created.
+  bool use_playbin3_ = true;
+  // ABR rendition switching. Off by default (kAbrSwitchingDefault): the stream
+  // stays pinned at 720p and the ABR engine only logs what it would do.
+  // SOATV_ABR=on turns switching back on for the whole process.
+  bool abr_switching_enabled_ = false;
   // Cold-start connection speed chosen in CreatePipeline(). playbin forwards
   // it to legacy hlsdemux itself; hlsdemux2 gets it in ConfigureAdaptiveDemux2.
   guint64 startup_conn_kbps_ = 0;
