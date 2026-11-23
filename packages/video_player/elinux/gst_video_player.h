@@ -185,6 +185,8 @@ class GstVideoPlayer {
   void StartAbrEngine();
   void StopAbrEngine();
   void AbrTick();
+  void UpdateVodBufferRamp();
+  void ApplyBufferTarget(double seconds);
   void CloseBurstLocked();
   void LogPlaybackHealth(GstState state, uint64_t frames,
                          std::chrono::steady_clock::time_point now,
@@ -383,6 +385,10 @@ class GstVideoPlayer {
   // renditions at segment boundaries, so playback never interrupts.
   std::thread abr_thread_;
   std::atomic<bool> abr_running_{false};
+  // On-demand playback grows its cache target as real buffer occupancy builds.
+  // Live playback keeps the existing fixed target.
+  std::atomic<double> buffer_target_secs_{60.0};
+  int vod_buffer_ramp_stage_ = 0;  // ABR thread only: 4 -> 14 -> 30 -> 60 s.
   std::mutex abr_mutex_;  // guards hls_demux_, burst state, abr_samples_
   std::condition_variable abr_cv_;
   GstElement* hls_demux_ = nullptr;  // ref held; released in DestroyPipeline

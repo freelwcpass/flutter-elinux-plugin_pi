@@ -196,16 +196,12 @@ void UninstallTimestampedLogging() {
 constexpr gint kAutoplugSelectTry = 0;
 constexpr gint kAutoplugSelectSkip = 2;
 
-// Buffer discipline retune (task #60, 2026-08-29). Doubled from 30 to 60 s to
-// give the multiqueue more headroom against jitter on marginal networks. The
-// ABR gates below (kHealthyBufferSecs, hardcoded 6 s / 15 s thresholds in
-// AbrTick) are ALSO doubled so ABR behavior semantics are preserved — the
-// gates fire at the same *fraction* of target, just with more absolute
-// cushion. Cache-target on the downstream multiqueue is separately widened at
-// DeepElementAddedHandler; kBufferTargetSecs is the display+ABR-scale target,
-// not the queue-size setting.
+// Maximum buffer target for live playback. VOD starts with a 4-second target
+// and expands it as real buffered occupancy reaches 4, 14, and 30 seconds.
 constexpr double kBufferTargetSecs = 60.0;
-constexpr gint64 kBufferTargetNs = 60000000000LL;
+constexpr double kVodInitialBufferTargetSecs = 4.0;
+constexpr double kVodBufferTargetsSecs[] = {14.0, 30.0, 60.0};
+constexpr double kVodAbrReadyBufferSecs = 14.0;
 
 // --- Anti-flap ABR tuning ---
 // The "healthy buffer" line, in seconds. A buffer at/above this PROVES the
@@ -980,8 +976,8 @@ bool GstVideoPlayer::Init() {
         // Fallback: percent-derived estimate for diagnostics only. It must not
         // decide startup readiness because a full queue does not prove that a
         // decoded frame reached the video sink.
-        buffer_health_secs =
-            (static_cast<double>(pct) / 100.0) * kBufferTargetSecs;
+        buffer_health_secs = (static_cast<double>(pct) / 100.0) *
+                             buffer_target_secs_.load();
       }
 
       const auto now = std::chrono::steady_clock::now();
@@ -2061,6 +2057,11 @@ bool GstVideoPlayer::CreatePipeline() {
   gst_element_add_pad(gst_.output, ghost_sinkpad);
   gst_object_unref(sinkpad);
 
+  const double initial_buffer_target =
+      is_live_ ? kBufferTargetSecs : kVodInitialBufferTargetSecs;
+  buffer_target_secs_.store(initial_buffer_target);
+  vod_buffer_ramp_stage_ = 0;
+
   g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
 
@@ -2078,26 +2079,16 @@ bool GstVideoPlayer::CreatePipeline() {
   // The origin emits 10 s HLS segments, so keep roughly three segments of
   // time-depth. This gives the player enough cushion for a late segment fetch.
   //
-  // STARTUP rung: a high initial connection-speed makes hlsdemux pick the top
-  // variant for the first segments, before the ABR engine has its >=2 samples
-  // (AbrTick early-returns until then). This is NOT for speed — it's the
-  // invariant that keeps the bcm2835-codec V4L2 input pool safe. Starting at a
-  // lower rung and letting ABR climb sets the pool to a small geometry first,
-  // then GROWS it on up-switch (OK), then tries to SHRINK it on the next
-  // down-switch (FAILS: S_FMT "Device has no supported format", verified
-  // 2026-07-30). Top-rung startup means the pool is set once at the largest
-  // geometry that will ever be seen; every subsequent switch is a no-op or a
-  // shrink the ISP can absorb via the pinned 1280x720 output geometry (see
-  // the sink-bin comment). If the ABR engine never gets samples (e.g. probe
-  // yields nothing) hlsdemux simply stays on the top rung.
-  // Cold-start rung. If soatv threaded a `#soatv:startup_kbps=N` hint
-  // through the URI fragment (from auth-GET throughput probe or a
-  // preceding ABR_RESTART decision), honor it. Otherwise fall back to
-  // the fixed default. Task #48 (2026-08-20) added the auth-probe path
-  // so cold-starts now match the actual network instead of always
-  // starting at 1500 kbps.
-  guint64 cold_start_kbps =
-      startup_kbps_hint_ > 0 ? startup_kbps_hint_ : kColdStartConnSpeedKbps;
+  // Fixed-rung playback preserves its configured cap. Adaptive VOD starts on
+  // the lowest rendition and holds it while the initial buffer grows; it then
+  // uses measured segment throughput to select quality. Live video is served
+  // through Zerorate's proxy, so its existing startup policy remains intact.
+  const bool start_vod_at_lowest = !is_live_ && abr_switching_enabled_;
+  guint64 cold_start_kbps = start_vod_at_lowest
+                                ? 100
+                                : startup_kbps_hint_ > 0
+                                      ? startup_kbps_hint_
+                                      : kColdStartConnSpeedKbps;
   if (!abr_switching_enabled_) {
     // Pinned: one rendition for the stream's whole life, so the app's
     // startup hint (auth-probe throughput or an old ABR_RESTART rung) can't
@@ -2109,14 +2100,20 @@ bool GstVideoPlayer::CreatePipeline() {
                             std::to_string(startup_kbps_hint_) + "kbps)"
                       : std::string())
               << std::endl;
+  } else if (start_vod_at_lowest) {
+    std::cout << "STARTUP-RUNG: on-demand starts at the lowest available "
+                 "rendition; waiting for measured throughput"
+              << std::endl;
   } else if (startup_kbps_hint_ > 0) {
     std::cout << "STARTUP-RUNG: honoring soatv hint " << startup_kbps_hint_
               << "kbps (instead of default " << kColdStartConnSpeedKbps
               << "kbps)" << std::endl;
   }
   startup_conn_kbps_ = cold_start_kbps;
-  g_object_set(gst_.playbin, "buffer-size", (gint)10485760,  // 10 MiB
-               "buffer-duration", kBufferTargetNs,           // 60 s (task #60)
+  const gint64 initial_buffer_target_ns = static_cast<gint64>(
+      initial_buffer_target * static_cast<double>(GST_SECOND));
+  g_object_set(gst_.playbin, "buffer-size", (gint)(10 * 1024 * 1024),
+               "buffer-duration", initial_buffer_target_ns,
                "connection-speed", cold_start_kbps, NULL);
 
   // Audio: audioconvert -> audioresample -> volume -> alsasink
@@ -2588,7 +2585,8 @@ void GstVideoPlayer::LogPlaybackHealth(
   if (query) gst_query_unref(query);
 
   if (used_estimate && has_position && pct >= 0) {
-    buffer_health_secs = (static_cast<double>(pct) / 100.0) * kBufferTargetSecs;
+    buffer_health_secs = (static_cast<double>(pct) / 100.0) *
+                         buffer_target_secs_.load();
     buffered_until_secs = position_secs + buffer_health_secs;
   }
 
@@ -2637,7 +2635,8 @@ void GstVideoPlayer::LogPlaybackHealth(
     std::cout << "unknown";
   }
 
-  std::cout << " Target Buffer: " << static_cast<int>(kBufferTargetSecs)
+  std::cout << " Target Buffer: "
+            << static_cast<int>(buffer_target_secs_.load())
             << " sec Frames: " << frames << " No Frame For: " << no_frame_ms
             << " ms";
 
@@ -3139,20 +3138,24 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
     std::cout << "MULTIQUEUE: playbin3 — leaving " << name << " at defaults"
               << std::endl;
   } else if (name && g_str_has_prefix(name, "multiqueue")) {
-    // hlsdemux's downstream multiqueue defaults to max-size-buffers=5,
-    // max-size-bytes=2MB, max-size-time=2s — a much smaller window than
-    // our 30 s buffering target. On a healthy link the buffering percent
-    // plateaus in the mid-teens because the multiqueue is applying
-    // backpressure to hlsdemux before hlsdemux has fetched a full 30 s
-    // cushion (device log 2026-07-31 09:37 saw pct stuck at ~17 for 25 s
-    // on a >4 Mbps average link). Widen the limits to 60 s / 20 MB and
-    // remove the buffer-count cap so time/bytes govern instead.
-    g_object_set(G_OBJECT(element), "max-size-buffers",
-                 (guint)0,  // unlimited count
-                 "max-size-bytes", (guint)(20 * 1024 * 1024), "max-size-time",
-                 (guint64)(60 * GST_SECOND), NULL);
+    // hlsdemux's downstream multiqueue defaults to a small queue. Keep its
+    // time limit aligned with the current target so VOD can grow in stages;
+    // live retains its existing 60-second / 20-MiB ceiling.
+    const double target_secs = self->buffer_target_secs_.load();
+    const guint max_bytes = self->is_live_
+                                ? static_cast<guint>(20 * 1024 * 1024)
+                                : std::max<guint>(
+                                      10 * 1024 * 1024,
+                                      static_cast<guint>(target_secs * 1024 * 1024));
+    const guint64 max_time =
+        static_cast<guint64>(target_secs * static_cast<double>(GST_SECOND));
+    g_object_set(G_OBJECT(element), "max-size-buffers", (guint)0,
+                 "max-size-bytes", max_bytes, "max-size-time", max_time,
+                 NULL);
     std::cout << "MULTIQUEUE: widened limits on " << name
-              << " (time=60s bytes=20MB buffers=unlimited)" << std::endl;
+              << " (time=" << static_cast<int>(target_secs)
+              << "s bytes=" << max_bytes / (1024 * 1024)
+              << "MB buffers=unlimited)" << std::endl;
   }
   g_free(name);
 }
@@ -3348,6 +3351,89 @@ void GstVideoPlayer::StopAbrEngine() {
   }
 }
 
+void GstVideoPlayer::UpdateVodBufferRamp() {
+  if (is_live_ || vod_buffer_ramp_stage_ >= 3 || !gst_.pipeline) return;
+
+  double buffered_secs = -1.0;
+  gint64 position = 0;
+  const bool has_position =
+      gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position);
+  GstQuery* query = gst_query_new_buffering(GST_FORMAT_TIME);
+  if (query && gst_element_query(gst_.pipeline, query)) {
+    GstFormat format = GST_FORMAT_TIME;
+    gint64 start = 0;
+    gint64 stop = -1;
+    gint64 estimated_total = -1;
+    gst_query_parse_buffering_range(query, &format, &start, &stop,
+                                    &estimated_total);
+    if (format == GST_FORMAT_TIME && has_position && stop >= position) {
+      buffered_secs = static_cast<double>(stop - position) /
+                      static_cast<double>(GST_SECOND);
+    }
+  }
+  if (query) gst_query_unref(query);
+
+  if (buffered_secs < 0.0) {
+    const int percent = last_buffering_percent_.load();
+    if (percent < 0) return;
+    buffered_secs = (static_cast<double>(percent) / 100.0) *
+                    buffer_target_secs_.load();
+  }
+
+  const double current_target = buffer_target_secs_.load();
+  if (buffered_secs + 0.25 < current_target) return;
+
+  const double next_target = kVodBufferTargetsSecs[vod_buffer_ramp_stage_++];
+  std::cout << "VOD-BUFFER: ramp " << static_cast<int>(current_target) << "s -> "
+            << static_cast<int>(next_target) << "s at occupancy="
+            << static_cast<int>(buffered_secs) << "s" << std::endl;
+  ApplyBufferTarget(next_target);
+}
+
+void GstVideoPlayer::ApplyBufferTarget(double seconds) {
+  if (seconds <= 0.0 || !gst_.pipeline || !gst_.playbin) return;
+  buffer_target_secs_.store(seconds);
+  const auto target_ns = static_cast<gint64>(seconds * GST_SECOND);
+  const auto target_bytes = static_cast<gint>(seconds * 1024 * 1024);
+  g_object_set(gst_.playbin, "buffer-duration", target_ns, "buffer-size",
+               target_bytes, NULL);
+
+  GstElement* demux = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(abr_mutex_);
+    if (hls_demux_) demux = GST_ELEMENT(gst_object_ref(hls_demux_));
+  }
+  if (demux) {
+    SetNumericProperty(demux, "max-buffering-time",
+                       static_cast<double>(target_ns));
+    SetNumericProperty(demux, "high-watermark-time",
+                       static_cast<double>(target_ns));
+    gst_object_unref(demux);
+  }
+
+  // Legacy hlsdemux is bounded by its downstream multiqueue. Grow that queue
+  // with the goal so it cannot cap the staged buffer at the initial target.
+  if (!use_playbin3_) {
+    GstIterator* iterator = gst_bin_iterate_recurse(GST_BIN(gst_.pipeline));
+    if (iterator) {
+      GValue item = G_VALUE_INIT;
+      while (gst_iterator_next(iterator, &item) == GST_ITERATOR_OK) {
+        auto* element = GST_ELEMENT(g_value_get_object(&item));
+        gchar* name = gst_element_get_name(element);
+        if (name && g_str_has_prefix(name, "multiqueue")) {
+          g_object_set(G_OBJECT(element), "max-size-buffers", (guint)0,
+                       "max-size-bytes", static_cast<guint>(target_bytes),
+                       "max-size-time", static_cast<guint64>(target_ns), NULL);
+        }
+        g_free(name);
+        g_value_reset(&item);
+      }
+      if (G_VALUE_TYPE(&item) != 0) g_value_unset(&item);
+      gst_iterator_free(iterator);
+    }
+  }
+}
+
 // adaptivedemux2 (hlsdemux2) setup. Our ABR engine stays in charge: it keeps
 // steering through connection-bitrate exactly as it steers legacy hlsdemux
 // through connection-speed, so the ABR_RESTART protection for live
@@ -3383,12 +3469,12 @@ void GstVideoPlayer::ConfigureAdaptiveDemux2(GstElement* demux) {
     }
   }
   // hlsdemux2 buffers internally and posts the BUFFERING messages itself.
-  // Put the high watermark at our buffering target so percent keeps meaning
-  // "percent of kBufferTargetSecs", which AbrTick's buffer zones assume.
-  SetNumericProperty(demux, "max-buffering-time",
-                     static_cast<double>(kBufferTargetNs));
-  SetNumericProperty(demux, "high-watermark-time",
-                     static_cast<double>(kBufferTargetNs));
+  // Align its initial watermarks with the current buffer target; VOD raises
+  // these as its staged buffer ramp advances.
+  const double initial_target_ns =
+      buffer_target_secs_.load() * static_cast<double>(GST_SECOND);
+  SetNumericProperty(demux, "max-buffering-time", initial_target_ns);
+  SetNumericProperty(demux, "high-watermark-time", initial_target_ns);
   for (const char* prop :
        {"max-buffering-time", "high-watermark-time",
         "low-watermark-time"}) {
@@ -3468,6 +3554,7 @@ void GstVideoPlayer::PollAdaptiveDemuxBandwidth() {
 }
 
 void GstVideoPlayer::AbrTick() {
+  UpdateVodBufferRamp();
   if (adaptive_demux2_.load()) PollAdaptiveDemuxBandwidth();
   std::deque<double> samples;
   GstElement* demux = nullptr;
@@ -3529,10 +3616,40 @@ void GstVideoPlayer::AbrTick() {
   double predicted_bps = std::min(fast, harmonic);
   predicted_bps *= std::min(1.0, std::max(0.5, 1.0 - 0.5 * cv));
 
-  // --- Buffer health (percent of the kBufferTargetSecs buffering target) ---
+  // --- Buffer health ---
   const int pct = last_buffering_percent_.load();
-  const double buffer_secs =
-      pct < 0 ? 20.0 : (static_cast<double>(pct) / 100.0) * kBufferTargetSecs;
+  double buffer_secs =
+      pct < 0 ? (is_live_ ? 20.0 : 0.0)
+              : (static_cast<double>(pct) / 100.0) *
+                    buffer_target_secs_.load();
+  if (!is_live_) {
+    gint64 position = 0;
+    const bool has_position =
+        gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position);
+    GstQuery* query = gst_query_new_buffering(GST_FORMAT_TIME);
+    if (query && gst_element_query(gst_.pipeline, query)) {
+      GstFormat format = GST_FORMAT_TIME;
+      gint64 start = 0;
+      gint64 stop = -1;
+      gint64 estimated_total = -1;
+      gst_query_parse_buffering_range(query, &format, &start, &stop,
+                                      &estimated_total);
+      if (format == GST_FORMAT_TIME && has_position && stop >= position) {
+        buffer_secs = static_cast<double>(stop - position) /
+                      static_cast<double>(GST_SECOND);
+      }
+    }
+    if (query) gst_query_unref(query);
+
+    // Keep the VOD startup rung low while the initial buffer grows to 14 s.
+    // The first 4-second segment can play immediately; the first bandwidth
+    // selection happens only after that initial cushion is established.
+    if (abr_switching_enabled_ && published_kbps_ == 0 &&
+        buffer_secs < kVodAbrReadyBufferSecs) {
+      gst_object_unref(demux);
+      return;
+    }
+  }
 
   // Scaled alongside kBufferTargetSecs 30 -> 60 (task #60). Emergency zone
   // now 0-12 s (was 0-6), cautious 12-30 (was 6-15), comfortable >= 30
@@ -4056,8 +4173,9 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
         if (buffering_left_ms > 0) {
           std::cout << " eta=" << (buffering_left_ms / 1000) << "s";
         }
-        std::cout << " cache-target=" << static_cast<int>(kBufferTargetSecs)
-                  << "s/10MiB from " << GST_MESSAGE_SRC_NAME(message)
+        std::cout << " cache-target="
+                  << static_cast<int>(self->buffer_target_secs_.load())
+                  << "s from " << GST_MESSAGE_SRC_NAME(message)
                   << std::endl;
       }
       break;
