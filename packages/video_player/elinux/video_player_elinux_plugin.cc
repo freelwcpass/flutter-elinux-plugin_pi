@@ -766,7 +766,10 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             if (!instance->event_sink) return;
             auto player = instance->GetPlayer();
             if (!player) return;
-            auto duration = player->GetDuration();
+            // Called from the bus sync handler on a streaming thread: use the
+            // cached duration, never a pipeline query (can deadlock against
+            // a state change on the platform thread).
+            auto duration = player->GetCachedDuration();
             if (duration < 0) duration = 0;
             int64_t buffered_end = (duration * percent) / 100;
 

@@ -62,6 +62,10 @@ class GstVideoPlayer {
   void SetAutoRepeat(bool /*auto_repeat*/) { auto_repeat_ = false; };
   bool SetSeek(int64_t position);
   int64_t GetDuration();
+  // Last duration GetDuration() obtained (-1 if none). Never queries the
+  // pipeline, so it is safe from GStreamer streaming threads (bus sync
+  // handler callbacks), where a query can deadlock against a state change.
+  int64_t GetCachedDuration() const { return last_known_duration_ms_.load(); }
   int64_t GetCurrentPosition();
   const uint8_t* GetFrameBuffer();
   // Stops the pipeline and frees the ALSA device and decoder now, on the
@@ -292,7 +296,15 @@ class GstVideoPlayer {
   std::atomic<bool> seek_in_progress_{false};
   std::atomic<int64_t> seek_target_ms_{0};
   std::atomic<int64_t> last_known_position_ms_{0};
+  std::atomic<int64_t> last_known_duration_ms_{-1};
   std::atomic<int64_t> last_seek_started_ticks_{0};
+  // True while DestroyPipeline() takes the pipeline to NULL. The bus sync
+  // handler runs on streaming threads; during teardown it must not query the
+  // pipeline or call into Flutter, or it can block on a lock the tearing-down
+  // thread holds while that thread waits for the streaming thread to stop
+  // (2026-11-23 freeze: main thread and souphttpsrc streaming thread both
+  // blocked forever after "DISPOSE: releasing pipeline").
+  std::atomic<bool> tearing_down_{false};
   std::mutex mutex_event_completed_;
   std::shared_mutex mutex_buffer_;
   std::unique_ptr<VideoPlayerStreamHandler> stream_handler_;

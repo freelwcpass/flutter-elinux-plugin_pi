@@ -106,6 +106,74 @@ void SetConnectionSpeedKbps(GstElement* element, guint64 kbps) {
   }
   SetNumericProperty(element, "connection-speed", static_cast<double>(kbps));
 }
+
+// Pipeline teardown deadlocks seen on devices (2026-11-26, gdb backtraces from
+// two frozen boxes):
+//  - set_state(NULL) never returned: hlsdemux2's change_state waited on its
+//    scheduler thread, which waited on its download thread, which waited on a
+//    mutex. The platform thread was joining that thread, so the app froze.
+//  - set_state(NULL) returned without the pipeline reaching NULL; the final
+//    unref then deactivated pads still owned by running streaming threads
+//    and blocked forever on a pad stream lock.
+// Neither can be undone from here, and keeping the half-dead pipeline is
+// unsafe (its streaming threads still call our probes and callbacks). So a
+// teardown that hangs or does not reach NULL aborts the process: the launcher
+// restarts SOATV within seconds (and keeps a core dump) instead of leaving
+// the box frozen with a dead remote.
+constexpr int kTeardownStallSecs = 20;
+
+class TeardownStallGuard {
+ public:
+  TeardownStallGuard() : state_(std::make_shared<State>()) {
+    std::shared_ptr<State> state = state_;
+    std::thread([state]() {
+      std::unique_lock<std::mutex> lock(state->mutex);
+      if (!state->cv.wait_for(lock, std::chrono::seconds(kTeardownStallSecs),
+                              [&state] { return state->done; })) {
+        std::cerr << "TEARDOWN-STUCK: pipeline teardown did not finish in "
+                  << kTeardownStallSecs
+                  << "s; aborting so the launcher restarts SOATV" << std::endl;
+        std::abort();
+      }
+    }).detach();
+  }
+  ~TeardownStallGuard() {
+    {
+      std::lock_guard<std::mutex> lock(state_->mutex);
+      state_->done = true;
+    }
+    state_->cv.notify_all();
+  }
+  TeardownStallGuard(const TeardownStallGuard&) = delete;
+  TeardownStallGuard& operator=(const TeardownStallGuard&) = delete;
+
+ private:
+  struct State {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+  };
+  std::shared_ptr<State> state_;
+};
+
+// Takes the pipeline to NULL and waits for it. Returns true once it is NULL.
+bool SetPipelineNull(GstElement* pipeline, const char* attempt) {
+  const GstStateChangeReturn set_ret =
+      gst_element_set_state(pipeline, GST_STATE_NULL);
+  GstState current = GST_STATE_VOID_PENDING;
+  const GstStateChangeReturn get_ret = gst_element_get_state(
+      pipeline, &current, NULL, GST_CLOCK_TIME_NONE);
+  if (set_ret != GST_STATE_CHANGE_FAILURE &&
+      get_ret != GST_STATE_CHANGE_FAILURE && current == GST_STATE_NULL) {
+    return true;
+  }
+  std::cerr << "TEARDOWN: " << attempt << " NULL transition incomplete (set="
+            << gst_element_state_change_return_get_name(set_ret)
+            << ", get=" << gst_element_state_change_return_get_name(get_ret)
+            << ", state=" << gst_element_state_get_name(current) << ")"
+            << std::endl;
+  return false;
+}
 }  // namespace
 
 namespace {
@@ -1369,6 +1437,7 @@ int64_t GstVideoPlayer::GetDuration() {
     return -1;
   }
   duration_msec /= GST_MSECOND;
+  last_known_duration_ms_.store(duration_msec);
   return duration_msec;
 }
 
@@ -2313,6 +2382,13 @@ void GstVideoPlayer::ReleasePipeline() {
 }
 
 void GstVideoPlayer::DestroyPipeline() {
+  // Aborts the process if anything below hangs: the watchdog/ABR thread
+  // joins, the NULL transition, or the final unref (see TeardownStallGuard).
+  TeardownStallGuard stall_guard;
+
+  // From here until the sync handler is detached below, HandleGstMessage()
+  // drops every message without touching the pipeline or Flutter.
+  tearing_down_.store(true);
   play_state_requested_.store(false);
   StopWatchdog();
   StopAbrEngine();
@@ -2335,8 +2411,16 @@ void GstVideoPlayer::DestroyPipeline() {
   }
 
   if (gst_.pipeline) {
-    gst_element_set_state(gst_.pipeline, GST_STATE_NULL);
-    gst_element_get_state(gst_.pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
+    if (!SetPipelineNull(gst_.pipeline, "first") &&
+        !SetPipelineNull(gst_.pipeline, "retry")) {
+      // Unreffing a pipeline whose streaming threads still run deadlocks on
+      // a pad stream lock, and keeping it lets those threads call into this
+      // object after it is gone. Restart instead.
+      std::cerr << "TEARDOWN-FAILED: pipeline did not reach NULL; aborting "
+                   "so the launcher restarts SOATV"
+                << std::endl;
+      std::abort();
+    }
   }
 
   // A handoff in flight between disabling signal-handoffs and the NULL
@@ -2373,6 +2457,11 @@ void GstVideoPlayer::DestroyPipeline() {
       hls_demux_ = nullptr;
     }
   }
+
+  last_known_duration_ms_.store(-1);
+  // The old bus is detached; a pipeline built after this (restart paths call
+  // DestroyPipeline() then create a new one) gets a working handler again.
+  tearing_down_.store(false);
 }
 
 std::string GstVideoPlayer::ParseUri(const std::string& uri) {
@@ -3946,6 +4035,16 @@ void GstVideoPlayer::AbrTick() {
 GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
                                                  GstMessage* message,
                                                  gpointer user_data) {
+  // Teardown in progress: the messages are about a pipeline being destroyed
+  // (e.g. the playlist-error storm the old HLS source posts as its downloads
+  // are cancelled). Handling them would query the pipeline and call into
+  // Flutter from this streaming thread, which can deadlock with the thread
+  // taking the pipeline to NULL. Drop them.
+  if (reinterpret_cast<GstVideoPlayer*>(user_data)->tearing_down_.load()) {
+    gst_message_unref(message);
+    return GST_BUS_DROP;
+  }
+
   // Capture every bus message into the ring buffer for post-collapse dumps.
   // Skip a couple of very-high-frequency types to keep the buffer meaningful —
   // BUFFERING fires many times per second on some streams and would flood the
@@ -4032,9 +4131,10 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
         // handled by the watchdog Check 1 below (it fires OnNotifyError so
         // Flutter can re-authenticate and rebuild the pipeline).
 
-        gint64 position = 0;
-        const bool has_position = gst_element_query_position(
-            self->gst_.pipeline, GST_FORMAT_TIME, &position);
+        // No pipeline query here: this runs on a streaming thread, and a
+        // query can block on a lock held by a concurrent state change.
+        const int64_t position_ms = self->last_known_position_ms_.load();
+        const bool has_position = position_ms > 0;
         const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - self->buffering_log_start_time_);
 
@@ -4048,7 +4148,7 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
         std::cout << "BUFFERING: " << percent << "% elapsed=" << elapsed.count()
                   << "s";
         if (has_position) {
-          std::cout << " pos=" << (position / GST_SECOND) << "s";
+          std::cout << " pos=" << (position_ms / 1000) << "s";
         }
         if (avg_in_bps > 0) {
           std::cout << " dl=" << (avg_in_bps / 1024) << "KB/s";
